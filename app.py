@@ -1,4 +1,4 @@
-\from pathlib import Path
+from pathlib import Path
 
 import cv2
 import gdown
@@ -21,18 +21,16 @@ MODEL_ID = "1sO3yNwEIu9oCfP3W_wlC6r07fhv0hEYI"
 MODEL_NAME = "best_brain_tumor_finetuned.keras"
 IMG_SIZE = (224, 224)
 
-# Alphabetical folder order: ['glioma', 'meningioma', 'notumor', 'pituitary']
+# Folder names sorted alphabetically = class_names printed in the notebook:
+# ['glioma', 'meningioma', 'notumor', 'pituitary']
 CLASS_NAMES = ["Glioma", "Meningioma", "No Tumor", "Pituitary Tumor"]
 
-# Model pipeline: input -> data_augmentation -> preprocess_input -> resnet50
-#                 -> gap -> dropout -> dense_features -> class_predictions
-# The saved model expects RAW 0-255 RGB pixels.
-
-# Grad-CAM layer: final ResNet50 feature map (feeds GAP)
-CAM_LAYERS = {
-    "conv5_block3_out (7x7)": "conv5_block3_out",
-}
-USE_LOGIT_TARGET = True  # explain the pre-softmax class score
+# The saved model was built as:
+#   input -> data_augmentation -> preprocess_input -> resnet50 -> gap
+#         -> dropout -> dense_features -> class_predictions
+# So the model itself expects RAW 0-255 RGB pixels.
+GRADCAM_LAYER = "conv5_block3_out"  # final ResNet50 feature map (feeds GAP)
+USE_LOGIT_TARGET = True             # explain the pre-softmax class score
 
 
 # --------------------------------------------------
@@ -48,7 +46,9 @@ def load_model():
     if not model_path.exists() or model_path.stat().st_size < 1_000_000:
         if model_path.exists():
             model_path.unlink()
-        gdown.download(id=MODEL_ID, output=str(model_path), quiet=False, fuzzy=True)
+        gdown.download(
+            id=MODEL_ID, output=str(model_path), quiet=False, fuzzy=True
+        )
 
     if not model_path.exists() or model_path.stat().st_size < 1_000_000:
         raise RuntimeError(
@@ -65,22 +65,13 @@ def load_model():
         model.get_layer(name)  # raises a clear error if a layer is missing
 
     resnet = model.get_layer("resnet50")
+    conv_layer = resnet.get_layer(GRADCAM_LAYER)
 
-    # One backbone-with-feature-map model per candidate layer.
-    # Each returns (feature map, backbone output).
-    grad_models = {}
-    for label, layer_name in CAM_LAYERS.items():
-        try:
-            conv_layer = resnet.get_layer(layer_name)
-        except ValueError:
-            continue
-        grad_models[label] = tf.keras.Model(
-            inputs=resnet.inputs,
-            outputs=[conv_layer.output, resnet.output],
-        )
-
-    if not grad_models:
-        raise RuntimeError("None of the Grad-CAM layers were found in resnet50.")
+    # Backbone that returns (final conv feature map, backbone output)
+    grad_model = tf.keras.Model(
+        inputs=resnet.inputs,
+        outputs=[conv_layer.output, resnet.output],
+    )
 
     head = {
         "gap": model.get_layer("gap"),
@@ -88,7 +79,7 @@ def load_model():
         "dense": model.get_layer("dense_features"),
         "classifier": model.get_layer("class_predictions"),
     }
-    return model, grad_models, head
+    return model, grad_model, head
 
 
 # --------------------------------------------------
@@ -96,7 +87,11 @@ def load_model():
 # --------------------------------------------------
 
 def prepare_image(image: Image.Image):
-    """Returns the original RGB image and a 1x224x224x3 RAW (0-255) batch."""
+    """Returns the original RGB image and a 1x224x224x3 RAW (0-255) batch.
+
+    Resizing uses tf.image.resize (bilinear), the same method used by
+    image_dataset_from_directory during training.
+    """
     original = np.asarray(image.convert("RGB"), dtype=np.uint8)
     resized = tf.image.resize(
         tf.convert_to_tensor(original, dtype=tf.float32), IMG_SIZE
@@ -105,38 +100,23 @@ def prepare_image(image: Image.Image):
 
 
 def backbone_preprocess(raw_batch):
+    # Same function used inside the model during training.
     return tf.keras.applications.resnet50.preprocess_input(raw_batch)
 
 
 # --------------------------------------------------
-# PREDICTION + GRAD-CAM / GRAD-CAM++
+# PREDICTION + GRAD-CAM
 # --------------------------------------------------
 
-def compute_cam(conv_output, gradients, method):
-    """Return an (H, W) class activation map from feature maps and gradients."""
-    if method == "Grad-CAM++":
-        g2 = tf.square(gradients)
-        g3 = g2 * gradients
-        denom = 2.0 * g2 + tf.reduce_sum(conv_output * g3, axis=(1, 2), keepdims=True)
-        denom = tf.where(tf.abs(denom) > 1e-12, denom, tf.ones_like(denom))
-        alpha = g2 / denom
-        weights = tf.reduce_sum(alpha * tf.nn.relu(gradients), axis=(1, 2))
-    else:  # standard Grad-CAM
-        weights = tf.reduce_mean(gradients, axis=(1, 2))
-
-    cam = tf.reduce_sum(conv_output * weights[:, None, None, :], axis=-1)
-    return tf.nn.relu(cam)[0].numpy()
-
-
-def predict_and_gradcam(raw_batch, model, grad_models, head, layer_label, method):
+def predict_and_gradcam(raw_batch, model, grad_model, head):
     x_raw = tf.convert_to_tensor(raw_batch, dtype=tf.float32)
 
     # 1) The real prediction comes from the full saved model.
     probabilities = model(x_raw, training=False).numpy()[0]
     predicted_index = int(np.argmax(probabilities))
 
-    # 2) CAM path: preprocess_input -> backbone -> same head layers.
-    grad_model = grad_models[layer_label]
+    # 2) Grad-CAM path: preprocess_input -> backbone -> same head layers.
+    #    (data_augmentation does nothing at inference time.)
     backbone_input = backbone_preprocess(x_raw)
 
     with tf.GradientTape() as tape:
@@ -151,7 +131,8 @@ def predict_and_gradcam(raw_batch, model, grad_models, head, layer_label, method
         can_use_logits = (
             USE_LOGIT_TARGET
             and isinstance(classifier, tf.keras.layers.Dense)
-            and getattr(classifier.activation, "__name__", "") in ("softmax", "linear")
+            and getattr(classifier.activation, "__name__", "")
+            in ("softmax", "linear")
         )
         if can_use_logits:
             logits = tf.matmul(h, classifier.kernel) + classifier.bias
@@ -164,21 +145,26 @@ def predict_and_gradcam(raw_batch, model, grad_models, head, layer_label, method
     if gradients is None:
         raise RuntimeError("Gradients could not be calculated.")
 
-    cam = compute_cam(conv_output, gradients, method)
+    weights = tf.reduce_mean(gradients, axis=(1, 2))
+    cam = tf.reduce_sum(conv_output * weights[:, None, None, :], axis=-1)
+    cam = tf.nn.relu(cam)[0].numpy()
 
     peak = float(cam.max())
     if not np.all(np.isfinite(cam)) or peak <= 1e-8:
-        raise RuntimeError("No positive activation for this class.")
+        raise RuntimeError("No positive Grad-CAM activation for this class.")
     cam = cam / peak
 
-    # 3) Safety check: the CAM path must reproduce the real output.
+    # 3) Safety check: the Grad-CAM path must reproduce the real output.
     paths_match = bool(
         np.allclose(probabilities, cam_probs.numpy()[0], rtol=1e-3, atol=1e-4)
     )
     if logits is not None:
         paths_match = paths_match and bool(
             np.allclose(
-                probabilities, tf.nn.softmax(logits[0]).numpy(), rtol=1e-3, atol=1e-4
+                probabilities,
+                tf.nn.softmax(logits[0]).numpy(),
+                rtol=1e-3,
+                atol=1e-4,
             )
         )
     max_diff = float(np.max(np.abs(probabilities - cam_probs.numpy()[0])))
@@ -187,85 +173,18 @@ def predict_and_gradcam(raw_batch, model, grad_models, head, layer_label, method
 
 
 # --------------------------------------------------
-# HEAD / BRAIN MASK
-# --------------------------------------------------
-
-def head_mask(original_rgb):
-    """Soft 0-1 mask of the imaged head, so heat is never drawn on the black
-    background or at the image border (a known CNN padding artefact)."""
-    gray = cv2.cvtColor(original_rgb, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (7, 7), 0)
-
-    thr = max(8.0, 0.12 * float(np.percentile(gray, 99)))
-    binary = (gray > thr).astype(np.uint8) * 255
-
-    h, w = binary.shape
-    k = max(3, int(min(h, w) * 0.03) | 1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-    # keep the largest connected component
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
-    if n > 1:
-        largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-        binary = ((labels == largest) * 255).astype(np.uint8)
-
-    # fill holes (flood the outside, invert)
-    flood = binary.copy()
-    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(flood, ff_mask, (0, 0), 255)
-    binary = binary | cv2.bitwise_not(flood)
-
-    area = float(binary.astype(bool).mean())
-    if area < 0.05 or area > 0.98:  # unreliable mask -> do not use it
-        return np.ones((h, w), np.float32)
-
-    soft = cv2.GaussianBlur(binary.astype(np.float32) / 255.0, (0, 0), sigmaX=max(h, w) / 80)
-    return np.clip(soft, 0.0, 1.0)
-
-
-# --------------------------------------------------
 # HEATMAP AND OVERLAY
 # --------------------------------------------------
 
-def _normalize(x):
-    peak = float(x.max())
-    return x / peak if peak > 1e-6 else x
-
-
-def create_visualizations(original_image, cam, use_mask, focus, single_region, min_level):
+def create_visualizations(original_image, heatmap):
     h, w = original_image.shape[:2]
-
-    # smooth upsampling
-    big = cv2.resize(cam.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
+    big = cv2.resize(heatmap.astype(np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
     big = np.clip(big, 0.0, 1.0)
-    big = cv2.GaussianBlur(big, (0, 0), sigmaX=max(h, w) / 100)
-
-    # remove border / background activation
-    if use_mask:
-        big = big * head_mask(original_image)
-    big = _normalize(big)
-
-    # focus: drop weak, diffuse activation so only the strongest evidence stays
-    if focus > 0:
-        big = np.clip((big - focus) / (1.0 - focus), 0.0, 1.0)
-
-    # keep only the connected region that contains the strongest activation
-    if single_region and big.max() > 0:
-        n, labels = cv2.connectedComponents((big > 0).astype(np.uint8), connectivity=8)
-        py, px = np.unravel_index(np.argmax(big), big.shape)
-        big = big * (labels == labels[py, px])
-
-    # soften edges of the remaining blob
-    big = cv2.GaussianBlur(big, (0, 0), sigmaX=max(h, w) / 60)
-    big = _normalize(big)
 
     heat_bgr = cv2.applyColorMap(np.uint8(big * 255), cv2.COLORMAP_JET)
     heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
-
-    alpha = np.clip((big - min_level) / (1.0 - min_level + 1e-6), 0.0, 1.0)[..., None] * 0.65
-    overlay = original_image.astype(np.float32) * (1 - alpha) + heat_rgb.astype(np.float32) * alpha
-    return heat_rgb, np.uint8(np.clip(overlay, 0, 255))
+    overlay = cv2.addWeighted(original_image, 0.60, heat_rgb, 0.40, 0)
+    return heat_rgb, overlay
 
 
 # --------------------------------------------------
@@ -282,18 +201,6 @@ st.warning(
     "medical diagnostic tool."
 )
 
-with st.sidebar:
-    st.header("Grad-CAM settings")
-    method = st.selectbox("Method", ["Grad-CAM", "Grad-CAM++"], index=0)
-    layer_label = next(iter(CAM_LAYERS))
-    use_mask = st.checkbox("Restrict heat to the head region", value=True)
-    focus = st.slider("Focus (hide weak activation)", 0.0, 0.8, 0.45, 0.05,
-                      help="Higher = only the strongest evidence is shown.")
-    single_region = st.checkbox("Show only the strongest region", value=True,
-                                help="Untick to also see secondary regions.")
-    min_level = st.slider("Overlay threshold", 0.0, 0.9, 0.15, 0.05,
-                          help="Activations below this level are not coloured in the overlay.")
-
 uploaded_file = st.file_uploader("Upload MRI image", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
@@ -302,15 +209,11 @@ if uploaded_file is not None:
         original_image, raw_batch = prepare_image(image)
 
         with st.spinner("Analyzing MRI image..."):
-            model, grad_models, head = load_model()
-            if layer_label not in grad_models:
-                layer_label = next(iter(grad_models))
-            probabilities, predicted_index, cam, paths_match, max_diff = (
-                predict_and_gradcam(raw_batch, model, grad_models, head, layer_label, method)
+            model, grad_model, head = load_model()
+            probabilities, predicted_index, heatmap, paths_match, max_diff = (
+                predict_and_gradcam(raw_batch, model, grad_model, head)
             )
-            heatmap_rgb, overlay = create_visualizations(
-                original_image, cam, use_mask, focus, single_region, min_level
-            )
+            heatmap_rgb, overlay = create_visualizations(original_image, heatmap)
 
         st.success("Analysis completed.")
 
@@ -330,13 +233,13 @@ if uploaded_file is not None:
         else:
             col1, col2, col3 = st.columns(3)
             col1.image(original_image, caption="Original MRI", use_container_width=True)
-            col2.image(heatmap_rgb, caption=f"{method} Heatmap", use_container_width=True)
+            col2.image(heatmap_rgb, caption="Grad-CAM Heatmap", use_container_width=True)
             col3.image(overlay, caption="Heatmap Overlay", use_container_width=True)
             st.caption(
-                f"{method} shows regions that influenced the predicted class score "
-                f"at {cam.shape[0]} x {cam.shape[1]} resolution, upsampled for display. "
-                "It does not outline the tumour and does not prove accurate tumour "
-                "localization."
+                f"Grad-CAM shows regions that influenced the predicted class score "
+                f"at {heatmap.shape[0]} x {heatmap.shape[1]} resolution, upsampled for "
+                "display. It does not outline the tumour and does not prove "
+                "accurate tumour localization."
             )
 
         st.subheader("Class Scores")
@@ -348,15 +251,12 @@ if uploaded_file is not None:
         with st.expander("Technical details"):
             st.write("Input: raw 0-255 RGB, resized to 224 x 224")
             st.write("Model pipeline: augmentation (off at inference) -> preprocess_input -> ResNet50")
-            st.write("CAM method:", method)
-            st.write("CAM layer:", CAM_LAYERS[layer_label], f"({cam.shape[0]}x{cam.shape[1]})")
-            st.write("Head-region mask applied:", use_mask)
-            st.write("Focus:", focus, "| strongest region only:", single_region)
+            st.write("Grad-CAM layer:", GRADCAM_LAYER)
             st.write(
                 "Gradient target:",
                 "pre-softmax class score" if USE_LOGIT_TARGET else "class probability",
             )
-            st.write("CAM path matches model output:", paths_match)
+            st.write("Grad-CAM path matches model output:", paths_match)
             st.write(f"Max probability difference: {max_diff:.2e}")
 
     except Exception as error:
