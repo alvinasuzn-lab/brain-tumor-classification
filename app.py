@@ -1,4 +1,4 @@
-from pathlib import Path
+\from pathlib import Path
 
 import cv2
 import gdown
@@ -28,13 +28,9 @@ CLASS_NAMES = ["Glioma", "Meningioma", "No Tumor", "Pituitary Tumor"]
 #                 -> gap -> dropout -> dense_features -> class_predictions
 # The saved model expects RAW 0-255 RGB pixels.
 
-# Candidate feature maps for Grad-CAM (name -> spatial size for 224x224 input).
-# The old code only used the 7x7 map, which is very coarse and prone to
-# border artefacts. 14x14 gives noticeably finer localisation.
+# Grad-CAM layer: final ResNet50 feature map (feeds GAP)
 CAM_LAYERS = {
-    "conv5_block3_out (7x7, coarse)": "conv5_block3_out",
-    "conv4_block6_out (14x14, finer)": "conv4_block6_out",
-    "conv3_block4_out (28x28, finest)": "conv3_block4_out",
+    "conv5_block3_out (7x7)": "conv5_block3_out",
 }
 USE_LOGIT_TARGET = True  # explain the pre-softmax class score
 
@@ -289,7 +285,7 @@ st.warning(
 with st.sidebar:
     st.header("Grad-CAM settings")
     method = st.selectbox("Method", ["Grad-CAM", "Grad-CAM++"], index=0)
-    layer_label = st.selectbox("Feature layer", list(CAM_LAYERS.keys()), index=0)
+    layer_label = next(iter(CAM_LAYERS))
     use_mask = st.checkbox("Restrict heat to the head region", value=True)
     focus = st.slider("Focus (hide weak activation)", 0.0, 0.8, 0.45, 0.05,
                       help="Higher = only the strongest evidence is shown.")
