@@ -1,336 +1,387 @@
 
-import io
 from pathlib import Path
+import io
 
 import cv2
 import numpy as np
 import streamlit as st
 import tensorflow as tf
-
 from PIL import Image
 from tensorflow.keras.applications.resnet50 import preprocess_input
 
 
-# =====================================================
-# 1. CONFIGURATION
-# =====================================================
-
+# --------------------------------------------------
+# PAGE CONFIGURATION
+# --------------------------------------------------
 st.set_page_config(
-    page_title="Brain Tumor MRI Classification",
+    page_title="Brain Tumor MRI Classifier",
     page_icon="🧠",
-    layout="wide"
+    layout="wide",
 )
-
-CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
-IMG_SIZE = (224, 224)
-
-MODEL_PATH = (
-    Path(__file__).parent / "best_brain_tumor_finetuned.keras"
-)
-
-
-# =====================================================
-# 2. LOAD MODEL
-# =====================================================
-
-@st.cache_resource
-def load_model():
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Cannot find {MODEL_PATH.name}. "
-            "Keep the model beside app.py."
-        )
-
-    model = tf.keras.models.load_model(MODEL_PATH)
-
-    for name in [
-        "resnet50", "gap", "dropout",
-        "dense_features", "class_predictions"
-    ]:
-        try:
-            model.get_layer(name)
-        except ValueError as exc:
-            raise ValueError(
-                f"Required model layer '{name}' is missing."
-            ) from exc
-
-    return model
-
-
-# =====================================================
-# 3. GRAYSCALE GRAD-CAM
-# =====================================================
-
-def generate_gradcam(image_array, model, class_index):
-    """
-    Standard Grad-CAM using a higher-resolution intermediate
-    ResNet50 layer. Returns grayscale activation and overlay.
-    """
-
-    base = model.get_layer("resnet50")
-    conv_layer = base.get_layer("conv4_block6_out")
-    classifier = model.get_layer("class_predictions")
-
-    feature_model = tf.keras.Model(
-        inputs=base.input,
-        outputs=[conv_layer.output, base.output]
-    )
-
-    batch = image_array.astype(np.float32)[None, ...]
-    processed = preprocess_input(batch)
-
-    with tf.GradientTape() as tape:
-        conv_outputs, base_outputs = feature_model(
-            processed,
-            training=False
-        )
-
-        # Use the existing trained classification head.
-        x = model.get_layer("gap")(base_outputs)
-        x = model.get_layer("dropout")(x, training=False)
-        x = model.get_layer("dense_features")(x)
-
-        if not isinstance(classifier, tf.keras.layers.Dense):
-            raise ValueError(
-                "The class_predictions layer is not Dense."
-            )
-
-        logits = tf.linalg.matmul(x, classifier.kernel)
-
-        if classifier.use_bias:
-            logits = tf.nn.bias_add(logits, classifier.bias)
-
-        class_score = logits[:, class_index]
-
-    gradients = tape.gradient(class_score, conv_outputs)
-
-    if gradients is None:
-        return None, None, (
-            "Grad-CAM gradients are unavailable. "
-            "The model's gradient connection needs inspection."
-        )
-
-    # Standard Grad-CAM channel weights.
-    weights = tf.reduce_mean(
-        gradients,
-        axis=(1, 2),
-        keepdims=True
-    )
-
-    cam = tf.reduce_sum(
-        conv_outputs * weights,
-        axis=-1
-    )[0]
-
-    cam = tf.nn.relu(cam).numpy()
-
-    if not np.all(np.isfinite(cam)):
-        return None, None, "Invalid numerical values in the heatmap."
-
-    maximum = float(cam.max())
-
-    if maximum < 1e-8:
-        return None, None, (
-            "No meaningful positive Grad-CAM activation was found "
-            "for this image."
-        )
-
-    cam = cam / maximum
-
-    # Resize smoothly to the MRI dimensions.
-    cam = cv2.resize(
-        cam,
-        (image_array.shape[1], image_array.shape[0]),
-        interpolation=cv2.INTER_CUBIC
-    )
-
-    cam = np.clip(cam, 0, 1)
-
-    # Improve display contrast using only existing activation values.
-    # This changes appearance, not the model's localization.
-    positive = cam[cam > 0]
-
-    if positive.size > 0:
-        low = float(np.percentile(positive, 5))
-        high = float(np.percentile(positive, 99))
-
-        if high > low:
-            cam = np.clip((cam - low) / (high - low), 0, 1)
-
-    # Convert activation into a visible grayscale image.
-    grayscale_heatmap = np.uint8(cam * 255)
-
-    # Create a grayscale MRI and overlay.
-    grayscale_mri = cv2.cvtColor(
-        image_array,
-        cv2.COLOR_RGB2GRAY
-    )
-
-    overlay = cv2.addWeighted(
-        grayscale_mri,
-        0.65,
-        grayscale_heatmap,
-        0.35,
-        0
-    )
-
-    return grayscale_heatmap, overlay, None
-
-
-# =====================================================
-# 4. PREDICTION
-# =====================================================
-
-def predict_mri(image, model):
-    image = image.convert("RGB").resize(IMG_SIZE)
-    original = np.array(image, dtype=np.uint8)
-
-    probabilities = model.predict(
-        original.astype(np.float32)[None, ...],
-        verbose=0
-    )[0]
-
-    if len(probabilities) != len(CLASS_NAMES):
-        raise ValueError(
-            "The model did not return four class scores."
-        )
-
-    predicted_index = int(np.argmax(probabilities))
-
-    heatmap, overlay, cam_error = generate_gradcam(
-        original,
-        model,
-        predicted_index
-    )
-
-    scores = {
-        CLASS_NAMES[i]: float(probabilities[i])
-        for i in range(len(CLASS_NAMES))
-    }
-
-    return original, scores, heatmap, overlay, cam_error
-
-
-# =====================================================
-# 5. STREAMLIT INTERFACE
-# =====================================================
 
 st.title("🧠 Brain Tumor MRI Classification")
-
 st.write(
-    "Upload a brain MRI to view the predicted class, "
-    "class scores, and grayscale Grad-CAM."
+    "Upload a brain MRI image to classify it into one of four "
+    "categories. The Grad-CAM visualization is an approximate "
+    "model explanation, not a confirmed tumor boundary."
 )
 
-st.warning(
-    "Educational project only. This is not a medical diagnostic "
-    "tool. Grad-CAM does not establish tumour boundaries."
-)
+# --------------------------------------------------
+# MODEL CONFIGURATION
+# --------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_FILENAME = "best_brain_tumor_finetuned.keras"
 
+CLASS_NAMES = [
+    "glioma",
+    "meningioma",
+    "notumor",
+    "pituitary",
+]
+
+
+# --------------------------------------------------
+# FIND MODEL FILE
+# --------------------------------------------------
+def find_model_path():
+    possible_paths = [
+        BASE_DIR / MODEL_FILENAME,
+        BASE_DIR / "models" / MODEL_FILENAME,
+        BASE_DIR / "model" / MODEL_FILENAME,
+    ]
+
+    for path in possible_paths:
+        if path.is_file():
+            return path
+
+    return None
+
+
+# --------------------------------------------------
+# LOAD MODEL
+# --------------------------------------------------
+@st.cache_resource
+def load_model(model_path_string):
+    return tf.keras.models.load_model(
+        model_path_string,
+        compile=False,
+    )
+
+
+model_path = find_model_path()
+
+if model_path is None:
+    st.error("The trained model file was not found.")
+
+    st.markdown(
+        """
+        **How to fix this**
+
+        1. Open your GitHub repository:
+           `brain-tumor-classification`
+        2. Upload `best_brain_tumor_finetuned.keras`.
+        3. Place it in the same folder as `app.py`.
+        4. Commit the uploaded file and wait for Streamlit Cloud
+           to redeploy.
+
+        Your repository should contain:
+
+        - `app.py`
+        - `requirements.txt`
+        - `best_brain_tumor_finetuned.keras`
+        """
+    )
+
+    st.stop()
+
+try:
+    model = load_model(str(model_path))
+except Exception as exc:
+    st.error("The model file exists, but TensorFlow could not load it.")
+    st.exception(exc)
+    st.stop()
+
+
+# --------------------------------------------------
+# PREPROCESS MRI IMAGE
+# --------------------------------------------------
+def prepare_image(image):
+    image = image.convert("RGB")
+    image = image.resize((224, 224))
+
+    image_array = np.asarray(image, dtype=np.float32)
+    batch = np.expand_dims(image_array, axis=0)
+
+    return batch
+
+
+# --------------------------------------------------
+# PREDICTION
+# --------------------------------------------------
+def predict_mri(image):
+    batch = prepare_image(image)
+    predictions = model.predict(batch, verbose=0)[0]
+
+    if len(predictions) != len(CLASS_NAMES):
+        raise ValueError(
+            f"Expected 4 output scores, but received "
+            f"{len(predictions)}."
+        )
+
+    predicted_index = int(np.argmax(predictions))
+    predicted_class = CLASS_NAMES[predicted_index]
+    confidence = float(predictions[predicted_index])
+
+    return predicted_class, confidence, predictions, batch
+
+
+# --------------------------------------------------
+# GRAD-CAM
+# --------------------------------------------------
+def generate_gradcam(batch, class_index):
+    """
+    Generates a grayscale Grad-CAM explanation using the
+    trained ResNet50 feature extractor.
+
+    Returns:
+        grayscale activation map, grayscale MRI overlay
+
+    Returns (None, None) if the model architecture does not
+    support this Grad-CAM implementation.
+    """
+    try:
+        base_model = model.get_layer("resnet50")
+
+        # Locate a convolutional feature layer.
+        layer_names = {layer.name for layer in base_model.layers}
+
+        if "conv4_block6_out" in layer_names:
+            target_layer_name = "conv4_block6_out"
+        elif "conv5_block3_out" in layer_names:
+            target_layer_name = "conv5_block3_out"
+        else:
+            return None, None
+
+        feature_model = tf.keras.Model(
+            inputs=base_model.input,
+            outputs=[
+                base_model.get_layer(target_layer_name).output,
+                base_model.output,
+            ],
+        )
+
+        # Follow the trained classification head.
+        gap_layer = model.get_layer("gap")
+        dropout_layer = model.get_layer("dropout")
+        dense_layer = model.get_layer("dense_features")
+        output_layer = model.get_layer("class_predictions")
+
+        # Grad-CAM needs the gradients of the chosen class score
+        # with respect to the convolutional feature maps.
+        rgb_batch = tf.convert_to_tensor(batch, dtype=tf.float32)
+        processed_batch = preprocess_input(rgb_batch)
+
+        with tf.GradientTape() as tape:
+            conv_outputs, backbone_output = feature_model(
+                processed_batch,
+                training=False,
+            )
+
+            tape.watch(conv_outputs)
+
+            x = gap_layer(backbone_output)
+            x = dropout_layer(x, training=False)
+            x = dense_layer(x)
+
+            logits = tf.linalg.matmul(
+                x,
+                output_layer.kernel,
+            )
+
+            if output_layer.use_bias:
+                logits = logits + output_layer.bias
+
+            class_score = logits[:, class_index]
+
+        gradients = tape.gradient(class_score, conv_outputs)
+
+        if gradients is None:
+            return None, None
+
+        # Average gradients over the spatial dimensions.
+        weights = tf.reduce_mean(
+            gradients,
+            axis=(1, 2),
+            keepdims=True,
+        )
+
+        cam = tf.reduce_sum(
+            weights * conv_outputs,
+            axis=-1,
+        )[0]
+
+        cam = tf.nn.relu(cam).numpy()
+
+        if not np.isfinite(cam).all() or cam.max() <= 1e-8:
+            return None, None
+
+        # Normalize activation.
+        cam = cam / (cam.max() + 1e-8)
+
+        # Resize to the original 224 x 224 input dimensions.
+        cam = cv2.resize(
+            cam,
+            (224, 224),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+        cam = np.clip(cam, 0, 1)
+
+        # Improve grayscale contrast while preserving activation
+        # ordering. This does not make localization more accurate.
+        positive_values = cam[cam > 0]
+
+        if positive_values.size > 10:
+            low = np.percentile(positive_values, 5)
+            high = np.percentile(positive_values, 99)
+
+            if high > low:
+                cam = np.clip((cam - low) / (high - low), 0, 1)
+
+        # Grayscale activation map.
+        heatmap_gray = np.uint8(cam * 255)
+
+        # Grayscale MRI background.
+        original = batch[0].astype(np.uint8)
+        original_gray = cv2.cvtColor(
+            original,
+            cv2.COLOR_RGB2GRAY,
+        )
+
+        # Blend grayscale MRI with grayscale activation map.
+        overlay_gray = cv2.addWeighted(
+            original_gray,
+            0.65,
+            heatmap_gray,
+            0.35,
+            0,
+        )
+
+        return heatmap_gray, overlay_gray
+
+    except Exception as exc:
+        st.warning(f"Grad-CAM could not be generated: {exc}")
+        return None, None
+
+
+# --------------------------------------------------
+# IMAGE UPLOAD
+# --------------------------------------------------
 uploaded_file = st.file_uploader(
-    "Upload brain MRI",
-    type=["jpg", "jpeg", "png"]
+    "Upload a brain MRI image",
+    type=["jpg", "jpeg", "png"],
 )
-
-
-# =====================================================
-# 6. DISPLAY RESULTS
-# =====================================================
 
 if uploaded_file is not None:
     try:
         image = Image.open(uploaded_file).convert("RGB")
 
         st.subheader("Uploaded MRI")
-        st.image(image, width=350)
+        st.image(
+            image,
+            caption="Original MRI image",
+            width=400,
+        )
 
-        if st.button(
-            "Classify MRI",
-            type="primary",
-            use_container_width=True
-        ):
-            with st.spinner("Analysing MRI..."):
-                model = load_model()
-
-                original, scores, heatmap, overlay, cam_error = (
-                    predict_mri(image, model)
+        if st.button("Classify MRI", type="primary"):
+            with st.spinner("Analyzing MRI..."):
+                predicted_class, confidence, scores, batch = (
+                    predict_mri(image)
                 )
 
-            predicted_class = max(scores, key=scores.get)
-            confidence = scores[predicted_class] * 100
+                heatmap, overlay = generate_gradcam(
+                    batch,
+                    int(np.argmax(scores)),
+                )
 
             st.divider()
-            st.subheader("Prediction Results")
+            st.subheader("Classification Result")
 
-            col1, col2 = st.columns(2)
-
-            with col1:
-                st.metric("Predicted class", predicted_class.title())
-
-            with col2:
-                st.metric("Model output score", f"{confidence:.2f}%")
-
-            st.caption(
-                "The score is the model's output, not a guarantee "
-                "of medical diagnostic accuracy."
+            st.success(
+                f"Predicted category: {predicted_class.upper()}"
             )
 
-            st.subheader("Class Scores")
+            st.metric(
+                "Model score",
+                f"{confidence * 100:.2f}%",
+            )
 
-            st.bar_chart({
-                name.title(): value * 100
-                for name, value in scores.items()
-            })
+            st.caption(
+                "This score is the model's output, not a medical "
+                "diagnosis or a guarantee of accuracy."
+            )
 
-            for name, value in scores.items():
-                st.write(f"**{name.title()}:** {value * 100:.2f}%")
+            st.subheader("Scores for Each Category")
+
+            for name, score in zip(CLASS_NAMES, scores):
+                st.write(f"**{name.capitalize()}**")
+                st.progress(
+                    float(np.clip(score, 0.0, 1.0)),
+                    text=f"{score * 100:.2f}%",
+                )
 
             st.divider()
-            st.subheader("Grayscale Grad-CAM")
+            st.subheader("Grayscale Grad-CAM Explanation")
 
-            if cam_error:
-                st.warning(cam_error)
-                st.image(
-                    original,
-                    caption="Original MRI — heatmap unavailable",
-                    use_container_width=True
-                )
-            else:
+            if heatmap is not None and overlay is not None:
                 col1, col2, col3 = st.columns(3)
 
                 with col1:
                     st.image(
-                        original,
+                        image,
                         caption="Original MRI",
-                        use_container_width=True
+                        use_container_width=True,
                     )
 
                 with col2:
                     st.image(
                         heatmap,
-                        caption="Grayscale Activation",
+                        caption="Grayscale activation map",
                         clamp=True,
-                        use_container_width=True
+                        use_container_width=True,
                     )
 
                 with col3:
                     st.image(
                         overlay,
-                        caption="Grayscale Overlay",
+                        caption="Grayscale overlay",
                         clamp=True,
-                        use_container_width=True
+                        use_container_width=True,
                     )
 
+                output_image = Image.fromarray(overlay)
                 buffer = io.BytesIO()
-                Image.fromarray(overlay).save(buffer, format="PNG")
+                output_image.save(buffer, format="PNG")
 
                 st.download_button(
-                    "Download Grayscale Overlay",
+                    label="Download grayscale Grad-CAM",
                     data=buffer.getvalue(),
-                    file_name="grayscale_gradcam.png",
-                    mime="image/png"
+                    file_name="brain_mri_gradcam.png",
+                    mime="image/png",
                 )
 
-    except Exception as error:
-        st.error("An error occurred while processing the MRI.")
-        st.exception(error)
+                st.info(
+                    "Bright areas indicate regions that influenced "
+                    "the model's score. Grad-CAM is approximate and "
+                    "does not establish the exact tumor location."
+                )
+            else:
+                st.warning(
+                    "The classification completed, but a reliable "
+                    "Grad-CAM map could not be generated for this "
+                    "image and model architecture."
+                )
+
+    except Exception as exc:
+        st.error("Something went wrong while processing the MRI.")
+        st.exception(exc)
