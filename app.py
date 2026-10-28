@@ -40,11 +40,11 @@ st.write(
 # =====================================================
 # DOWNLOAD AND LOAD MODEL
 # =====================================================
-@st.cache_resource(show_spinner="Loading the trained model...")
+@st.cache_resource(show_spinner="Preparing the trained model...")
 def load_model():
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Reuse a previously downloaded model if it is loadable.
+    # Reuse an existing model if it loads successfully.
     if MODEL_PATH.is_file() and MODEL_PATH.stat().st_size > 1_000_000:
         try:
             with MODEL_PATH.open("rb") as file:
@@ -61,7 +61,7 @@ def load_model():
 
         MODEL_PATH.unlink(missing_ok=True)
 
-    # Use the Google Drive direct-download URL.
+    # Download the model from Google Drive.
     url = f"https://drive.google.com/uc?id={MODEL_ID}"
 
     try:
@@ -69,8 +69,7 @@ def load_model():
             url=url,
             output=str(MODEL_PATH),
             quiet=False,
-            fuzzy=True,
-            resume=True,
+            resume=False,
         )
     except Exception as error:
         MODEL_PATH.unlink(missing_ok=True)
@@ -82,17 +81,15 @@ def load_model():
         MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError(
             "Google Drive did not provide the model file. "
-            "Check that sharing is set to Anyone with the link "
-            "and Viewer. Google Drive may also be limiting downloads."
+            "Check the sharing permissions and download availability."
         )
 
-    # Detect an incomplete download or an HTML error page.
+    # Check for a likely incomplete download or an error page.
     if MODEL_PATH.stat().st_size < 1_000_000:
         MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError(
             "The downloaded file is too small to be the model. "
-            "Google Drive may have returned an access, quota, "
-            "or confirmation page instead."
+            "Google Drive may have returned an access or quota error."
         )
 
     with MODEL_PATH.open("rb") as file:
@@ -101,7 +98,7 @@ def load_model():
     if header.startswith(b"version https://git-lfs.github.com/spec/v1"):
         MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError(
-            "A Git LFS pointer was downloaded instead of the model."
+            "The downloaded file is a Git LFS pointer, not the actual model."
         )
 
     try:
@@ -111,8 +108,7 @@ def load_model():
     except Exception as error:
         MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError(
-            "The downloaded file could not be loaded as a Keras model. "
-            "Check whether Google Drive returned the actual model file."
+            "The downloaded file could not be loaded as a Keras model."
         ) from error
 
 
@@ -122,10 +118,10 @@ except Exception as error:
     st.error("Unable to prepare the trained model.")
     st.code(str(error))
     st.info(
-        "Open the Google Drive model's Share settings and confirm "
-        "General access is Anyone with the link — Viewer. "
-        "If that is already correct, Google Drive may be blocking "
-        "automated downloads or enforcing a download limit."
+        "Check that Google Drive General access is set to "
+        "'Anyone with the link — Viewer'. If access is correct, "
+        "Google Drive may be blocking automated downloads or "
+        "enforcing a download limit."
     )
     st.stop()
 
