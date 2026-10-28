@@ -3,6 +3,7 @@ from pathlib import Path
 import io
 
 import cv2
+import gdown
 import numpy as np
 import streamlit as st
 import tensorflow as tf
@@ -19,129 +20,99 @@ st.set_page_config(
     layout="wide",
 )
 
-CLASS_NAMES = [
-    "glioma",
-    "meningioma",
-    "notumor",
-    "pituitary",
-]
-
+CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
 MODEL_NAME = "best_brain_tumor_finetuned.keras"
+MODEL_ID = "1sO3yNwEIu9oCfP3W_wlC6r07fhv0hEYI"
 
-APP_DIR = Path(__file__).resolve().parent
-WORK_DIR = Path.cwd()
+MODEL_DIR = Path.home() / ".brain_tumor_model"
+MODEL_PATH = MODEL_DIR / MODEL_NAME
 
 st.title("🧠 Brain MRI Classification")
 st.caption("Fine-tuned ResNet50 | Four-class classification")
 
 st.write(
-    "Upload an MRI image to obtain a model prediction. "
+    "Upload a brain MRI image to obtain a model prediction. "
     "Grad-CAM is optional and provides an approximate explanation."
 )
 
 
 # =====================================================
-# FIND MODEL IN REPOSITORY
+# DOWNLOAD MODEL FROM GOOGLE DRIVE
 # =====================================================
-def find_model():
-    candidates = [
-        APP_DIR / MODEL_NAME,
-        WORK_DIR / MODEL_NAME,
-        APP_DIR / "models" / MODEL_NAME,
-        WORK_DIR / "models" / MODEL_NAME,
-        APP_DIR / "model" / MODEL_NAME,
-        WORK_DIR / "model" / MODEL_NAME,
-    ]
+@st.cache_resource(show_spinner="Preparing the trained model...")
+def load_model():
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Search known paths first.
-    checked = set()
+    # Reuse an existing complete model download.
+    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 1_000_000:
+        with MODEL_PATH.open("rb") as f:
+            if not f.read(100).startswith(
+                b"version https://git-lfs.github.com/spec/v1"
+            ):
+                try:
+                    return tf.keras.models.load_model(
+                        str(MODEL_PATH), compile=False
+                    )
+                except Exception:
+                    MODEL_PATH.unlink(missing_ok=True)
 
-    for path in candidates:
-        path = path.resolve()
+    # Download from the shared Google Drive file.
+    try:
+        downloaded = gdown.download(
+            id=MODEL_ID,
+            output=str(MODEL_PATH),
+            quiet=False,
+            fuzzy=True,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "Google Drive download failed. Check that the model is shared "
+            "as Anyone with the link - Viewer, and try again."
+        ) from error
 
-        if path in checked:
-            continue
-        checked.add(path)
+    if not downloaded or not MODEL_PATH.exists():
+        MODEL_PATH.unlink(missing_ok=True)
+        raise RuntimeError(
+            "The model could not be downloaded. Check Google Drive sharing "
+            "permissions and whether the download quota has been exceeded."
+        )
 
-        if path.is_file():
-            return path
+    # Reject tiny error pages or Git LFS pointer files.
+    if MODEL_PATH.stat().st_size < 1_000_000:
+        MODEL_PATH.unlink(missing_ok=True)
+        raise RuntimeError(
+            "The downloaded file is too small to be the trained model. "
+            "Google Drive may have returned an access or quota error."
+        )
 
-    # Search subdirectories as a fallback.
-    search_roots = {APP_DIR, WORK_DIR}
-
-    for root in search_roots:
-        try:
-            for path in root.rglob(MODEL_NAME):
-                if path.is_file():
-                    return path.resolve()
-        except (OSError, PermissionError):
-            continue
-
-    return None
-
-
-model_path = find_model()
-
-if model_path is None:
-    st.error("The trained model file was not found.")
-
-    st.write("Locations checked:")
-    st.code(
-        f"App directory: {APP_DIR}\n"
-        f"Working directory: {WORK_DIR}\n"
-        f"Expected filename: {MODEL_NAME}"
-    )
-
-    st.info(
-        "Check the repository file list and confirm that the model "
-        "is committed to the same branch used by Streamlit Cloud."
-    )
-    st.stop()
-
-
-# =====================================================
-# CHECK FOR GIT LFS POINTER
-# =====================================================
-try:
-    with open(model_path, "rb") as file:
-        header = file.read(200)
+    with MODEL_PATH.open("rb") as f:
+        header = f.read(200)
 
     if header.startswith(b"version https://git-lfs.github.com/spec/v1"):
-        st.error(
-            "GitHub supplied a Git LFS pointer instead of the "
-            "actual model file."
+        MODEL_PATH.unlink(missing_ok=True)
+        raise RuntimeError("A Git LFS pointer was downloaded instead of the model.")
+
+    try:
+        return tf.keras.models.load_model(
+            str(MODEL_PATH), compile=False
         )
-        st.write(
-            "The model must be correctly tracked and uploaded through "
-            "Git LFS. Check the Git LFS setup and redeploy the app."
-        )
-        st.stop()
-
-except OSError as error:
-    st.error(f"Unable to read the model file: {error}")
-    st.stop()
-
-
-# =====================================================
-# LOAD MODEL ONCE
-# =====================================================
-@st.cache_resource
-def load_model(path, modified_time, file_size):
-    return tf.keras.models.load_model(
-        path,
-        compile=False,
-    )
+    except Exception as error:
+        MODEL_PATH.unlink(missing_ok=True)
+        raise RuntimeError(
+            "The downloaded file could not be loaded as a Keras model."
+        ) from error
 
 
 try:
-    model = load_model(
-        str(model_path),
-        model_path.stat().st_mtime,
-        model_path.stat().st_size,
-    )
+    model = load_model()
 except Exception as error:
-    st.error("The model was found but could not be loaded.")
-    st.exception(error)
+    st.error("Unable to prepare the trained model.")
+    st.warning(str(error))
+    st.info(
+        "Check the Google Drive link permissions. If the file is public "
+        "but downloading still fails, Google Drive may be rate-limiting "
+        "the download."
+    )
     st.stop()
 
 
@@ -166,7 +137,6 @@ def predict_image(batch):
         )
 
     index = int(np.argmax(predictions))
-
     return CLASS_NAMES[index], predictions, index
 
 
@@ -178,10 +148,10 @@ def generate_gradcam(batch, class_index):
         backbone = model.get_layer("resnet50")
         layer_names = {layer.name for layer in backbone.layers}
 
-        if "conv4_block6_out" in layer_names:
-            target_name = "conv4_block6_out"
-        elif "conv5_block3_out" in layer_names:
+        if "conv5_block3_out" in layer_names:
             target_name = "conv5_block3_out"
+        elif "conv4_block6_out" in layer_names:
+            target_name = "conv4_block6_out"
         else:
             return None, None
 
@@ -204,18 +174,14 @@ def generate_gradcam(batch, class_index):
 
         with tf.GradientTape() as tape:
             conv_features, backbone_output = feature_model(
-                processed,
-                training=False,
+                processed, training=False
             )
 
             pooled = gap(backbone_output)
             dropped = dropout(pooled, training=False)
             features = dense(dropped)
 
-            logits = tf.linalg.matmul(
-                features,
-                output_layer.kernel,
-            )
+            logits = tf.linalg.matmul(features, output_layer.kernel)
 
             if output_layer.use_bias:
                 logits = logits + output_layer.bias
@@ -228,14 +194,11 @@ def generate_gradcam(batch, class_index):
             return None, None
 
         weights = tf.reduce_mean(
-            gradients,
-            axis=(1, 2),
-            keepdims=True,
+            gradients, axis=(1, 2), keepdims=True
         )
 
         cam = tf.reduce_sum(
-            weights * conv_features,
-            axis=-1,
+            weights * conv_features, axis=-1
         )[0]
 
         cam = tf.nn.relu(cam).numpy()
@@ -244,12 +207,7 @@ def generate_gradcam(batch, class_index):
             return None, None
 
         cam = cam / (cam.max() + 1e-8)
-
-        cam = cv2.resize(
-            cam,
-            (224, 224),
-            interpolation=cv2.INTER_LINEAR,
-        )
+        cam = cv2.resize(cam, (224, 224))
 
         activation = np.uint8(np.clip(cam, 0, 1) * 255)
 
@@ -257,15 +215,13 @@ def generate_gradcam(batch, class_index):
         gray = cv2.cvtColor(original, cv2.COLOR_RGB2GRAY)
 
         overlay = cv2.addWeighted(
-            gray, 0.65,
-            activation, 0.35,
-            0,
+            gray, 0.65, activation, 0.35, 0
         )
 
         return activation, overlay
 
     except Exception as error:
-        st.warning(f"Grad-CAM failed: {error}")
+        st.warning(f"Grad-CAM could not be generated: {error}")
         return None, None
 
 
@@ -281,11 +237,7 @@ if uploaded_file is not None:
     try:
         image = Image.open(uploaded_file).convert("RGB")
 
-        st.image(
-            image,
-            caption="Uploaded MRI",
-            width=400,
-        )
+        st.image(image, caption="Uploaded MRI", width=400)
 
         show_gradcam = st.checkbox(
             "Generate grayscale Grad-CAM",
@@ -350,9 +302,9 @@ if uploaded_file is not None:
                     )
 
                     st.info(
-                        "Grad-CAM highlights approximate regions "
-                        "that influenced the prediction. It does "
-                        "not show confirmed tumour boundaries."
+                        "Grad-CAM highlights approximate regions that "
+                        "influenced the prediction. It does not show "
+                        "confirmed tumour boundaries."
                     )
                 else:
                     st.warning(
@@ -366,6 +318,4 @@ if uploaded_file is not None:
 
 
 st.divider()
-st.caption(
-    "Academic project | Not intended for clinical diagnosis"
-)
+st.caption("Academic project | Not intended for clinical diagnosis")
