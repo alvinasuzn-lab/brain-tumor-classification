@@ -3,13 +3,14 @@ import streamlit as st
 import tensorflow as tf
 import numpy as np
 import cv2
+import gdown
 
 from PIL import Image
 from pathlib import Path
 
 
 # --------------------------------------------------
-# CONFIGURATION
+# PAGE SETTINGS
 # --------------------------------------------------
 
 st.set_page_config(
@@ -18,260 +19,281 @@ st.set_page_config(
     layout="wide"
 )
 
-# This order must match the class_indices used during training.
-CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
+CLASS_NAMES = [
+    "glioma",
+    "meningioma",
+    "notumor",
+    "pituitary"
+]
 
-MODEL_PATH = Path(__file__).parent / "best_brain_tumor_finetuned.keras"
 IMG_SIZE = (224, 224)
+
+# Google Drive ID of your trained model
+MODEL_ID = "1sO3yNwEIu9oCfP3W_wlC6r07fhv0hEYI"
+
+# Save the model in Streamlit Cloud's writable home directory
+MODEL_PATH = (
+    Path.home()
+    / ".brain_tumor_model"
+    / "best_brain_tumor_finetuned.keras"
+)
 
 
 # --------------------------------------------------
-# LOAD MODEL AND GRAD-CAM COMPONENTS
+# LOAD MODEL FROM GOOGLE DRIVE
 # --------------------------------------------------
 
 @st.cache_resource
 def load_model():
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Model file not found: {MODEL_PATH}. "
-            "Place best_brain_tumor_finetuned.keras beside app.py."
-        )
+
+    MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if not MODEL_PATH.exists() or MODEL_PATH.stat().st_size == 0:
+
+        with st.spinner("Downloading trained model from Google Drive..."):
+
+            if MODEL_PATH.exists():
+                MODEL_PATH.unlink()
+
+            downloaded = gdown.download(
+                id=MODEL_ID,
+                output=str(MODEL_PATH),
+                quiet=False,
+                fuzzy=True
+            )
+
+        if (
+            downloaded is None
+            or not MODEL_PATH.exists()
+            or MODEL_PATH.stat().st_size == 0
+        ):
+            raise FileNotFoundError(
+                "Model download failed. Check the Google Drive file ID "
+                "and make sure the file is shared as "
+                "'Anyone with the link – Viewer'."
+            )
 
     model = tf.keras.models.load_model(
-        MODEL_PATH,
+        str(MODEL_PATH),
         compile=False
     )
 
-    # Existing layers in your trained model.
-    augmentation_layer = model.get_layer("data_augmentation")
-    resnet = model.get_layer("resnet50")
-    gap_layer = model.get_layer("gap")
-    dropout_layer = model.get_layer("dropout")
-    dense_layer = model.get_layer("dense_features")
-    classifier_layer = model.get_layer("class_predictions")
+    # Check that the expected layers exist
+    required_layers = [
+        "data_augmentation",
+        "resnet50",
+        "gap",
+        "dropout",
+        "dense_features",
+        "class_predictions"
+    ]
 
-    # Final output activation of the final ResNet50 residual block.
-    conv_layer = resnet.get_layer("conv5_block3_out")
+    missing_layers = [
+        name for name in required_layers
+        if not any(layer.name == name for layer in model.layers)
+    ]
 
-    # Reuse the original model's input-to-augmentation path.
-    preprocessing_model = tf.keras.Model(
-        inputs=model.inputs,
-        outputs=augmentation_layer.output
-    )
-
-    # Extract final convolutional activations from ResNet50.
-    feature_model = tf.keras.Model(
-        inputs=resnet.inputs,
-        outputs=conv_layer.output
-    )
-
-    return (
-        model,
-        preprocessing_model,
-        feature_model,
-        gap_layer,
-        dropout_layer,
-        dense_layer,
-        classifier_layer
-    )
-
-
-# --------------------------------------------------
-# PREPARE MRI IMAGE
-# --------------------------------------------------
-
-def prepare_image(image):
-    image = image.convert("RGB").resize(IMG_SIZE)
-    original = np.asarray(image, dtype=np.uint8)
-
-    # Match the input format used by the original model.
-    batch = original.astype(np.float32)[None, ...]
-
-    return original, batch
-
-
-# --------------------------------------------------
-# PREDICTION
-# --------------------------------------------------
-
-def predict_mri(image_batch, model):
-    probabilities = model(
-        tf.convert_to_tensor(image_batch, dtype=tf.float32),
-        training=False
-    ).numpy()[0]
-
-    if probabilities.shape[0] != len(CLASS_NAMES):
+    if missing_layers:
         raise ValueError(
-            f"Expected {len(CLASS_NAMES)} outputs, "
-            f"but model returned {probabilities.shape[0]}."
+            "The loaded model does not have the expected layers: "
+            + ", ".join(missing_layers)
         )
 
-    # Verify that the outputs look like probabilities.
-    if (
-        not np.all(np.isfinite(probabilities))
-        or np.any(probabilities < -1e-5)
-        or np.any(probabilities > 1.00001)
-        or not np.isclose(np.sum(probabilities), 1.0, atol=1e-3)
-    ):
-        raise ValueError(
-            "Model outputs do not look like softmax probabilities. "
-            "Check the classifier activation before displaying confidence."
-        )
-
-    predicted_index = int(np.argmax(probabilities))
-
-    scores = {
-        CLASS_NAMES[i]: float(probabilities[i])
-        for i in range(len(CLASS_NAMES))
-    }
-
-    return scores, predicted_index
+    return model
 
 
 # --------------------------------------------------
 # GRAD-CAM
 # --------------------------------------------------
 
-def make_gradcam(
-    image_batch,
-    preprocessing_model,
-    feature_model,
-    gap_layer,
-    dropout_layer,
-    dense_layer,
-    classifier_layer,
-    class_index
-):
-    image_tensor = tf.convert_to_tensor(
-        image_batch,
-        dtype=tf.float32
+def make_gradcam(image_array, model, class_index):
+
+    # Get the same preprocessing/augmentation layer used in training
+    augmentation_layer = model.get_layer("data_augmentation")
+
+    preprocessing_model = tf.keras.Model(
+        inputs=model.inputs,
+        outputs=augmentation_layer.output
     )
 
-    # IMPORTANT:
-    # Follow the same model preprocessing path as prediction.
-    # Do not apply preprocess_input separately here.
-    backbone_input = preprocessing_model(
-        image_tensor,
-        training=False
+    # Get the ResNet50 backbone
+    resnet = model.get_layer("resnet50")
+
+    # Last convolutional feature map
+    conv_layer = resnet.get_layer("conv5_block3_out")
+
+    feature_model = tf.keras.Model(
+        inputs=resnet.input,
+        outputs=conv_layer.output
     )
+
+    # Use RGB pixel values in the same range as model prediction
+    batch = image_array.astype(np.float32)[None, ...]
+
+    # Apply the model's own preprocessing layer
+    processed = preprocessing_model(batch, training=False)
 
     with tf.GradientTape() as tape:
+
+        # Extract convolutional feature maps
         conv_outputs = feature_model(
-            backbone_input,
+            processed,
             training=False
         )
 
-        # Reconnect the final convolutional activations to
-        # the original trained classification head.
-        x = gap_layer(conv_outputs)
-        x = dropout_layer(x, training=False)
-        x = dense_layer(x)
-        class_predictions = classifier_layer(x)
+        # Reuse the original trained classification head
+        x = model.get_layer("gap")(conv_outputs)
+        x = model.get_layer("dropout")(x, training=False)
+        x = model.get_layer("dense_features")(x)
+        predictions = model.get_layer("class_predictions")(x)
 
-        # Target the predicted class score.
-        class_score = class_predictions[:, class_index]
+        # Score for the class being explained
+        class_score = predictions[:, class_index]
 
+    # Calculate gradients of the selected class score
     gradients = tape.gradient(class_score, conv_outputs)
 
     if gradients is None:
         raise ValueError(
-            "Could not calculate Grad-CAM gradients."
+            "Grad-CAM gradients could not be calculated."
         )
 
-    # Average gradients across spatial dimensions.
+    # Average gradients across the spatial dimensions
     channel_weights = tf.reduce_mean(
         gradients,
         axis=(1, 2)
     )
 
-    # Weighted sum of the feature maps.
+    # Weight feature maps using the gradients
     heatmap = tf.reduce_sum(
-        conv_outputs * channel_weights[:, None, None, :],
+        conv_outputs
+        * channel_weights[:, None, None, :],
         axis=-1
     )[0]
 
-    # Standard Grad-CAM uses positive class-supporting responses.
-    heatmap = tf.nn.relu(heatmap)
+    # Keep positive activations
+    heatmap = tf.maximum(heatmap, 0)
 
-    heatmap = heatmap.numpy()
-    max_value = float(np.max(heatmap))
+    heatmap_max = float(tf.reduce_max(heatmap).numpy())
 
-    if not np.isfinite(max_value) or max_value <= 1e-8:
+    if not np.isfinite(heatmap_max) or heatmap_max <= 1e-8:
         raise ValueError(
-            "Grad-CAM has no meaningful positive activation "
-            "for this target class on this image."
+            "Grad-CAM produced no meaningful positive activation "
+            "for this image."
         )
 
-    # Normalize without moving or reshaping activation locations.
-    heatmap = heatmap / max_value
+    heatmap = heatmap / heatmap_max
+    heatmap = heatmap.numpy()
 
-    # Upsample the coarse 7x7 map for display only.
+    # Resize heatmap to match the displayed MRI image
     heatmap = cv2.resize(
         heatmap,
-        IMG_SIZE,
+        (image_array.shape[1], image_array.shape[0]),
         interpolation=cv2.INTER_LINEAR
     )
+
     heatmap = np.clip(heatmap, 0, 1)
 
-    return heatmap
-
-
-# --------------------------------------------------
-# HEATMAP COLOURING AND OVERLAY
-# --------------------------------------------------
-
-def create_visualizations(original, heatmap):
-    height, width = original.shape[:2]
-
-    # Resize to the exact original display dimensions.
-    heatmap_resized = cv2.resize(
-        heatmap,
-        (width, height),
-        interpolation=cv2.INTER_LINEAR
-    )
-
-    heatmap_uint8 = np.uint8(
-        np.clip(heatmap_resized, 0, 1) * 255
-    )
-
-    # OpenCV colour maps return BGR; convert to RGB for Streamlit.
-    heatmap_bgr = cv2.applyColorMap(
-        heatmap_uint8,
+    # Convert heatmap to RGB for display
+    colored_heatmap = cv2.applyColorMap(
+        np.uint8(255 * heatmap),
         cv2.COLORMAP_JET
     )
 
-    heatmap_rgb = cv2.cvtColor(
-        heatmap_bgr,
+    colored_heatmap = cv2.cvtColor(
+        colored_heatmap,
         cv2.COLOR_BGR2RGB
     )
 
-    # Display blend only; no spatial shifting or lesion-based editing.
+    # Overlay heatmap on the original MRI
     overlay = cv2.addWeighted(
-        original,
+        image_array,
         0.60,
-        heatmap_rgb,
+        colored_heatmap,
         0.40,
         0
     )
 
-    return heatmap_rgb, overlay
+    return heatmap, colored_heatmap, overlay
 
 
 # --------------------------------------------------
-# STREAMLIT INTERFACE
+# PREDICTION
 # --------------------------------------------------
 
-st.title("🧠 Brain Tumor Classification from MRI Images")
+def predict_mri(uploaded_image, model):
 
+    # Convert image to RGB and resize
+    image = uploaded_image.convert("RGB").resize(IMG_SIZE)
+
+    original = np.array(image, dtype=np.uint8)
+
+    # The complete trained model handles its own preprocessing
+    batch = original.astype(np.float32)[None, ...]
+
+    predictions = model.predict(
+        batch,
+        verbose=0
+    )
+
+    probabilities = np.asarray(predictions[0], dtype=np.float32)
+
+    if len(probabilities) != len(CLASS_NAMES):
+        raise ValueError(
+            f"Expected {len(CLASS_NAMES)} class scores, "
+            f"but received {len(probabilities)}."
+        )
+
+    if not np.all(np.isfinite(probabilities)):
+        raise ValueError("The model returned invalid prediction scores.")
+
+    # If the final layer is softmax, these should be probabilities
+    if (
+        np.any(probabilities < 0)
+        or np.any(probabilities > 1)
+        or not np.isclose(np.sum(probabilities), 1.0, atol=1e-3)
+    ):
+        raise ValueError(
+            "The model output does not look like softmax probabilities. "
+            "Check the final layer and the original training setup."
+        )
+
+    predicted_index = int(np.argmax(probabilities))
+
+    # Explain the predicted class
+    heatmap, colored_heatmap, overlay = make_gradcam(
+        original,
+        model,
+        predicted_index
+    )
+
+    scores = {
+        CLASS_NAMES[i]: float(probabilities[i])
+        for i in range(len(CLASS_NAMES))
+    }
+
+    return (
+        scores,
+        predicted_index,
+        heatmap,
+        colored_heatmap,
+        overlay,
+        original
+    )
+
+
+# --------------------------------------------------
+# STREAMLIT USER INTERFACE
+# --------------------------------------------------
+
+st.title("🧠 Brain Tumor Classification")
 st.write(
-    "Upload an MRI image to view the model's predicted class, "
-    "confidence scores, and Grad-CAM visualization."
+    "Upload a brain MRI image to obtain a model prediction "
+    "and a Grad-CAM visualization."
 )
 
-st.warning(
-    "Educational project demonstration only. This model is not "
-    "validated for medical diagnosis. Grad-CAM highlights image "
-    "regions influencing the model; it does not confirm or segment a tumour."
+st.info(
+    "This is an educational AI project, not a medical diagnostic tool."
 )
 
 uploaded_file = st.file_uploader(
@@ -280,86 +302,105 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
+
     try:
-        image = Image.open(uploaded_file).convert("RGB")
-    except Exception as error:
-        st.error(f"Could not open this image: {error}")
-        st.stop()
+        uploaded_image = Image.open(uploaded_file)
 
-    st.subheader("Uploaded MRI")
-    st.image(image, use_container_width=True)
+        st.subheader("Uploaded MRI")
+        st.image(
+            uploaded_image,
+            caption="Input image",
+            width=350
+        )
 
-    if st.button("Classify MRI", type="primary"):
-        try:
-            with st.spinner("Analyzing image and generating Grad-CAM..."):
+        if st.button("Classify MRI", type="primary"):
+
+            with st.spinner("Loading model and analysing image..."):
+
+                model = load_model()
+
                 (
-                    model,
-                    preprocessing_model,
-                    feature_model,
-                    gap_layer,
-                    dropout_layer,
-                    dense_layer,
-                    classifier_layer
-                ) = load_model()
-
-                original, image_batch = prepare_image(image)
-
-                scores, predicted_index = predict_mri(
-                    image_batch,
-                    model
-                )
-
-                heatmap = make_gradcam(
-                    image_batch,
-                    preprocessing_model,
-                    feature_model,
-                    gap_layer,
-                    dropout_layer,
-                    dense_layer,
-                    classifier_layer,
-                    predicted_index
-                )
-
-                colored_heatmap, overlay = create_visualizations(
-                    original,
-                    heatmap
-                )
+                    scores,
+                    predicted_index,
+                    heatmap,
+                    colored_heatmap,
+                    overlay,
+                    original
+                ) = predict_mri(uploaded_image, model)
 
             predicted_class = CLASS_NAMES[predicted_index]
-            confidence = scores[predicted_class]
+            confidence = scores[predicted_class] * 100
 
-            st.subheader("Prediction Results")
+            st.divider()
+            st.subheader("Prediction")
+
             st.success(
-                f"Predicted class: {predicted_class} "
-                f"(model confidence: {confidence:.2%})"
+                f"Predicted class: {predicted_class.upper()}"
             )
 
-            st.write("Model confidence scores:")
-            st.bar_chart(scores)
+            st.metric(
+                label="Model confidence",
+                value=f"{confidence:.2f}%"
+            )
 
-            st.subheader("Grad-CAM Visualizations")
+            st.caption(
+                "Confidence is the model's output score, "
+                "not a measure of medical certainty."
+            )
+
+            st.subheader("Class scores")
+
+            for class_name, score in scores.items():
+
+                st.write(
+                    f"**{class_name.upper()}** — {score * 100:.2f}%"
+                )
+
+                st.progress(
+                    float(np.clip(score, 0, 1))
+                )
+
+            st.divider()
+            st.subheader("Grad-CAM Visualization")
 
             col1, col2, col3 = st.columns(3)
 
             with col1:
-                st.caption("Original MRI")
-                st.image(original, use_container_width=True)
+                st.image(
+                    original,
+                    caption="Original MRI",
+                    use_container_width=True
+                )
 
             with col2:
-                st.caption("Grad-CAM Heatmap")
-                st.image(colored_heatmap, use_container_width=True)
+                st.image(
+                    colored_heatmap,
+                    caption="Grad-CAM heatmap",
+                    use_container_width=True
+                )
 
             with col3:
-                st.caption("Heatmap Overlay")
-                st.image(overlay, use_container_width=True)
+                st.image(
+                    overlay,
+                    caption="Heatmap overlay",
+                    use_container_width=True
+                )
 
             st.caption(
-                "Warm colours represent stronger positive Grad-CAM "
-                "responses for the predicted class. They are not a "
-                "validated tumour boundary or a probability map of "
-                "tumour location."
+                "Grad-CAM highlights image regions that influence "
+                "the selected class score. It does not prove that "
+                "a tumour is present or accurately outline a tumour."
             )
 
-        except Exception as error:
-            st.error(f"Prediction failed: {error}")
-            st.exception(error)
+    except Exception as error:
+        st.error(f"Prediction failed: {error}")
+        st.info(
+            "If the error concerns downloading the model, verify "
+            "that the Google Drive file ID is correct and the file "
+            "is accessible to anyone with the link."
+        )
+
+else:
+    st.write(
+        "Supported formats: JPG, JPEG and PNG."
+    )
