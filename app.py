@@ -21,8 +21,9 @@ st.set_page_config(
 )
 
 CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
-MODEL_NAME = "best_brain_tumor_finetuned.keras"
+
 MODEL_ID = "1sO3yNwEIu9oCfP3W_wlC6r07fhv0hEYI"
+MODEL_NAME = "best_brain_tumor_finetuned.keras"
 
 MODEL_DIR = Path.home() / ".brain_tumor_model"
 MODEL_PATH = MODEL_DIR / MODEL_NAME
@@ -37,60 +38,71 @@ st.write(
 
 
 # =====================================================
-# DOWNLOAD MODEL FROM GOOGLE DRIVE
+# DOWNLOAD AND LOAD MODEL
 # =====================================================
-@st.cache_resource(show_spinner="Preparing the trained model...")
+@st.cache_resource(show_spinner="Loading the trained model...")
 def load_model():
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Reuse an existing complete model download.
-    if MODEL_PATH.exists() and MODEL_PATH.stat().st_size > 1_000_000:
-        with MODEL_PATH.open("rb") as f:
-            if not f.read(100).startswith(
+    # Reuse a previously downloaded model if it is loadable.
+    if MODEL_PATH.is_file() and MODEL_PATH.stat().st_size > 1_000_000:
+        try:
+            with MODEL_PATH.open("rb") as file:
+                header = file.read(200)
+
+            if not header.startswith(
                 b"version https://git-lfs.github.com/spec/v1"
             ):
-                try:
-                    return tf.keras.models.load_model(
-                        str(MODEL_PATH), compile=False
-                    )
-                except Exception:
-                    MODEL_PATH.unlink(missing_ok=True)
+                return tf.keras.models.load_model(
+                    str(MODEL_PATH), compile=False
+                )
+        except Exception:
+            pass
 
-    # Download from the shared Google Drive file.
+        MODEL_PATH.unlink(missing_ok=True)
+
+    # Use the Google Drive direct-download URL.
+    url = f"https://drive.google.com/uc?id={MODEL_ID}"
+
     try:
-        downloaded = gdown.download(
-            id=MODEL_ID,
+        result = gdown.download(
+            url=url,
             output=str(MODEL_PATH),
             quiet=False,
             fuzzy=True,
+            resume=True,
         )
     except Exception as error:
-        raise RuntimeError(
-            "Google Drive download failed. Check that the model is shared "
-            "as Anyone with the link - Viewer, and try again."
-        ) from error
-
-    if not downloaded or not MODEL_PATH.exists():
         MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError(
-            "The model could not be downloaded. Check Google Drive sharing "
-            "permissions and whether the download quota has been exceeded."
+            f"Google Drive download failed: {error}"
+        ) from error
+
+    if not result or not MODEL_PATH.is_file():
+        MODEL_PATH.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Google Drive did not provide the model file. "
+            "Check that sharing is set to Anyone with the link "
+            "and Viewer. Google Drive may also be limiting downloads."
         )
 
-    # Reject tiny error pages or Git LFS pointer files.
+    # Detect an incomplete download or an HTML error page.
     if MODEL_PATH.stat().st_size < 1_000_000:
         MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError(
-            "The downloaded file is too small to be the trained model. "
-            "Google Drive may have returned an access or quota error."
+            "The downloaded file is too small to be the model. "
+            "Google Drive may have returned an access, quota, "
+            "or confirmation page instead."
         )
 
-    with MODEL_PATH.open("rb") as f:
-        header = f.read(200)
+    with MODEL_PATH.open("rb") as file:
+        header = file.read(200)
 
     if header.startswith(b"version https://git-lfs.github.com/spec/v1"):
         MODEL_PATH.unlink(missing_ok=True)
-        raise RuntimeError("A Git LFS pointer was downloaded instead of the model.")
+        raise RuntimeError(
+            "A Git LFS pointer was downloaded instead of the model."
+        )
 
     try:
         return tf.keras.models.load_model(
@@ -99,7 +111,8 @@ def load_model():
     except Exception as error:
         MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError(
-            "The downloaded file could not be loaded as a Keras model."
+            "The downloaded file could not be loaded as a Keras model. "
+            "Check whether Google Drive returned the actual model file."
         ) from error
 
 
@@ -107,11 +120,12 @@ try:
     model = load_model()
 except Exception as error:
     st.error("Unable to prepare the trained model.")
-    st.warning(str(error))
+    st.code(str(error))
     st.info(
-        "Check the Google Drive link permissions. If the file is public "
-        "but downloading still fails, Google Drive may be rate-limiting "
-        "the download."
+        "Open the Google Drive model's Share settings and confirm "
+        "General access is Anyone with the link — Viewer. "
+        "If that is already correct, Google Drive may be blocking "
+        "automated downloads or enforcing a download limit."
     )
     st.stop()
 
@@ -236,7 +250,6 @@ uploaded_file = st.file_uploader(
 if uploaded_file is not None:
     try:
         image = Image.open(uploaded_file).convert("RGB")
-
         st.image(image, caption="Uploaded MRI", width=400)
 
         show_gradcam = st.checkbox(
