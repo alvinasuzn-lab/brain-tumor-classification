@@ -32,8 +32,8 @@ CLASS_NAMES = ["Glioma", "Meningioma", "No Tumor", "Pituitary Tumor"]
 # The old code only used the 7x7 map, which is very coarse and prone to
 # border artefacts. 14x14 gives noticeably finer localisation.
 CAM_LAYERS = {
-    "conv4_block6_out (14x14, finer)": "conv4_block6_out",
     "conv5_block3_out (7x7, coarse)": "conv5_block3_out",
+    "conv4_block6_out (14x14, finer)": "conv4_block6_out",
     "conv3_block4_out (28x28, finest)": "conv3_block4_out",
 }
 USE_LOGIT_TARGET = True  # explain the pre-softmax class score
@@ -232,25 +232,41 @@ def head_mask(original_rgb):
 # HEATMAP AND OVERLAY
 # --------------------------------------------------
 
-def create_visualizations(original_image, cam, use_mask, min_level):
+def _normalize(x):
+    peak = float(x.max())
+    return x / peak if peak > 1e-6 else x
+
+
+def create_visualizations(original_image, cam, use_mask, focus, single_region, min_level):
     h, w = original_image.shape[:2]
 
-    # bicubic upsampling + light smoothing removes the blocky look
+    # smooth upsampling
     big = cv2.resize(cam.astype(np.float32), (w, h), interpolation=cv2.INTER_CUBIC)
     big = np.clip(big, 0.0, 1.0)
     big = cv2.GaussianBlur(big, (0, 0), sigmaX=max(h, w) / 100)
 
+    # remove border / background activation
     if use_mask:
         big = big * head_mask(original_image)
+    big = _normalize(big)
 
-    peak = float(big.max())
-    if peak > 1e-6:
-        big = big / peak
+    # focus: drop weak, diffuse activation so only the strongest evidence stays
+    if focus > 0:
+        big = np.clip((big - focus) / (1.0 - focus), 0.0, 1.0)
+
+    # keep only the connected region that contains the strongest activation
+    if single_region and big.max() > 0:
+        n, labels = cv2.connectedComponents((big > 0).astype(np.uint8), connectivity=8)
+        py, px = np.unravel_index(np.argmax(big), big.shape)
+        big = big * (labels == labels[py, px])
+
+    # soften edges of the remaining blob
+    big = cv2.GaussianBlur(big, (0, 0), sigmaX=max(h, w) / 60)
+    big = _normalize(big)
 
     heat_bgr = cv2.applyColorMap(np.uint8(big * 255), cv2.COLORMAP_JET)
     heat_rgb = cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB)
 
-    # only draw colour where the activation is meaningful
     alpha = np.clip((big - min_level) / (1.0 - min_level + 1e-6), 0.0, 1.0)[..., None] * 0.65
     overlay = original_image.astype(np.float32) * (1 - alpha) + heat_rgb.astype(np.float32) * alpha
     return heat_rgb, np.uint8(np.clip(overlay, 0, 255))
@@ -272,10 +288,14 @@ st.warning(
 
 with st.sidebar:
     st.header("Grad-CAM settings")
-    method = st.selectbox("Method", ["Grad-CAM++", "Grad-CAM"], index=0)
+    method = st.selectbox("Method", ["Grad-CAM", "Grad-CAM++"], index=0)
     layer_label = st.selectbox("Feature layer", list(CAM_LAYERS.keys()), index=0)
     use_mask = st.checkbox("Restrict heat to the head region", value=True)
-    min_level = st.slider("Overlay threshold", 0.0, 0.9, 0.35, 0.05,
+    focus = st.slider("Focus (hide weak activation)", 0.0, 0.8, 0.45, 0.05,
+                      help="Higher = only the strongest evidence is shown.")
+    single_region = st.checkbox("Show only the strongest region", value=True,
+                                help="Untick to also see secondary regions.")
+    min_level = st.slider("Overlay threshold", 0.0, 0.9, 0.15, 0.05,
                           help="Activations below this level are not coloured in the overlay.")
 
 uploaded_file = st.file_uploader("Upload MRI image", type=["jpg", "jpeg", "png"])
@@ -293,7 +313,7 @@ if uploaded_file is not None:
                 predict_and_gradcam(raw_batch, model, grad_models, head, layer_label, method)
             )
             heatmap_rgb, overlay = create_visualizations(
-                original_image, cam, use_mask, min_level
+                original_image, cam, use_mask, focus, single_region, min_level
             )
 
         st.success("Analysis completed.")
@@ -335,6 +355,7 @@ if uploaded_file is not None:
             st.write("CAM method:", method)
             st.write("CAM layer:", CAM_LAYERS[layer_label], f"({cam.shape[0]}x{cam.shape[1]})")
             st.write("Head-region mask applied:", use_mask)
+            st.write("Focus:", focus, "| strongest region only:", single_region)
             st.write(
                 "Gradient target:",
                 "pre-softmax class score" if USE_LOGIT_TARGET else "class probability",
