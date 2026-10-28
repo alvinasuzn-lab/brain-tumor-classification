@@ -44,8 +44,8 @@ MODEL_PATH = (
 def load_model():
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"Model file not found: {MODEL_PATH.name}. "
-            "Place the model file in the same folder as app.py."
+            f"Cannot find {MODEL_PATH.name}. "
+            "Place it in the same folder as app.py."
         )
 
     model = tf.keras.models.load_model(MODEL_PATH)
@@ -58,12 +58,12 @@ def load_model():
         "class_predictions"
     ]
 
-    for name in required_layers:
+    for layer_name in required_layers:
         try:
-            model.get_layer(name)
+            model.get_layer(layer_name)
         except ValueError as exc:
             raise ValueError(
-                f"Required model layer '{name}' was not found."
+                f"Required model layer '{layer_name}' is missing."
             ) from exc
 
     return model
@@ -75,15 +75,12 @@ def load_model():
 
 def generate_gradcam(image_array, model, class_index):
     """
-    Generate Grad-CAM from an intermediate ResNet50 layer.
-
-    Uses conv4_block6_out for a higher spatial resolution
-    than conv5_block3_out.
+    Generate Grad-CAM using the final convolutional layer
+    of the trained ResNet50 model.
     """
 
     base = model.get_layer("resnet50")
-
-    conv_layer = base.get_layer("conv4_block6_out")
+    conv_layer = base.get_layer("conv5_block3_out")
 
     feature_model = tf.keras.Model(
         inputs=base.input,
@@ -95,7 +92,7 @@ def generate_gradcam(image_array, model, class_index):
 
     batch = image_array.astype(np.float32)[None, ...]
 
-    # Preprocess for the nested ResNet50 feature extractor.
+    # Match preprocessing inside the ResNet50 branch.
     processed = preprocess_input(batch)
 
     with tf.GradientTape() as tape:
@@ -104,48 +101,62 @@ def generate_gradcam(image_array, model, class_index):
             training=False
         )
 
-        # Follow the original trained classification head.
+        # Use the trained classification head.
         x = model.get_layer("gap")(base_outputs)
         x = model.get_layer("dropout")(x, training=False)
         x = model.get_layer("dense_features")(x)
         predictions = model.get_layer("class_predictions")(x)
 
-        class_score = predictions[:, class_index]
+        # Use the predicted class score.
+        # Log transformation can help with very small gradients.
+        class_score = tf.math.log(
+            tf.clip_by_value(
+                predictions[:, class_index],
+                1e-7,
+                1.0
+            )
+        )
 
     gradients = tape.gradient(class_score, conv_outputs)
 
     if gradients is None:
         raise ValueError(
             "Gradients could not be calculated. "
-            "Please check the saved model architecture."
+            "Check the model architecture."
         )
 
-    # Calculate channel importance.
+    # Calculate the importance of each feature-map channel.
     weights = tf.reduce_mean(
         gradients,
         axis=(1, 2),
         keepdims=True
     )
 
-    # Weighted combination of feature maps.
     heatmap = tf.reduce_sum(
         conv_outputs * weights,
         axis=-1
     )[0]
 
+    # Retain positive class contributions.
     heatmap = tf.maximum(heatmap, 0)
-
-    max_value = float(tf.reduce_max(heatmap).numpy())
-
-    if max_value < 1e-8:
-        raise ValueError(
-            "Grad-CAM activation is nearly zero for this image."
-        )
-
-    heatmap = heatmap / max_value
     heatmap = heatmap.numpy()
 
-    # Resize the feature map to the original image dimensions.
+    max_value = float(np.max(heatmap))
+
+    if not np.isfinite(max_value) or max_value < 1e-8:
+        # Never manufacture a heatmap when activation is absent.
+        blank_heatmap = np.zeros(
+            image_array.shape[:2],
+            dtype=np.float32
+        )
+
+        blank_colour = np.zeros_like(image_array)
+
+        return None, blank_colour, image_array.copy()
+
+    heatmap = heatmap / max_value
+
+    # Resize the heatmap to the MRI dimensions.
     heatmap = cv2.resize(
         heatmap,
         (image_array.shape[1], image_array.shape[0]),
@@ -154,10 +165,6 @@ def generate_gradcam(image_array, model, class_index):
 
     heatmap = np.clip(heatmap, 0, 1)
 
-    # Improve visual contrast; this does not add model information.
-    heatmap = np.power(heatmap, 0.7)
-
-    # Create the coloured heatmap.
     colored_heatmap = cv2.applyColorMap(
         np.uint8(255 * heatmap),
         cv2.COLORMAP_JET
@@ -168,7 +175,6 @@ def generate_gradcam(image_array, model, class_index):
         cv2.COLOR_BGR2RGB
     )
 
-    # Blend the heatmap and the original MRI.
     overlay = cv2.addWeighted(
         image_array,
         0.65,
@@ -181,7 +187,7 @@ def generate_gradcam(image_array, model, class_index):
 
 
 # ==================================================
-# 4. CLASSIFICATION
+# 4. PREDICT MRI CLASS
 # ==================================================
 
 def predict_mri(image, model):
@@ -189,11 +195,9 @@ def predict_mri(image, model):
 
     original = np.array(image, dtype=np.uint8)
 
-    # The complete model receives raw RGB pixels.
-    # Its own preprocessing layer is expected to handle
-    # preprocessing during prediction.
     batch = original.astype(np.float32)[None, ...]
 
+    # The full model receives raw RGB pixels, as during training.
     probabilities = model.predict(
         batch,
         verbose=0
@@ -201,8 +205,7 @@ def predict_mri(image, model):
 
     if len(probabilities) != len(CLASS_NAMES):
         raise ValueError(
-            "The model output does not contain four class scores. "
-            "Check the model and class order."
+            "Expected four output scores. Check model class order."
         )
 
     predicted_index = int(np.argmax(probabilities))
@@ -218,40 +221,34 @@ def predict_mri(image, model):
         for i in range(len(CLASS_NAMES))
     }
 
-    return (
-        original,
-        scores,
-        heatmap,
-        colored_heatmap,
-        overlay
-    )
+    return original, scores, heatmap, colored_heatmap, overlay
 
 
 # ==================================================
-# 5. STREAMLIT INTERFACE
+# 5. STREAMLIT USER INTERFACE
 # ==================================================
 
 st.title("🧠 Brain Tumor MRI Classification")
 
 st.write(
-    "Upload a brain MRI image to obtain a model prediction "
-    "and view the regions influencing that prediction."
+    "Upload a brain MRI image to view the predicted class, "
+    "model output scores, and Grad-CAM visualization."
 )
 
-st.info(
-    "This is an educational machine-learning project. "
-    "It is not a medical diagnostic tool. Consult a qualified "
-    "healthcare professional for medical interpretation."
+st.warning(
+    "Educational project demonstration only. This model is "
+    "not a medical diagnostic tool and must not replace "
+    "professional medical assessment."
 )
 
 uploaded_file = st.file_uploader(
-    "Upload an MRI image",
+    "Upload a brain MRI image",
     type=["jpg", "jpeg", "png"]
 )
 
 
 # ==================================================
-# 6. DISPLAY UPLOADED IMAGE
+# 6. PROCESS UPLOADED IMAGE
 # ==================================================
 
 if uploaded_file is not None:
@@ -263,7 +260,7 @@ if uploaded_file is not None:
 
         st.image(
             image,
-            caption="Original uploaded image",
+            caption="Original MRI",
             width=350
         )
 
@@ -273,8 +270,7 @@ if uploaded_file is not None:
             use_container_width=True
         ):
 
-            with st.spinner("Analysing MRI..."):
-
+            with st.spinner("Loading model and analysing MRI..."):
                 model = load_model()
 
                 (
@@ -285,11 +281,7 @@ if uploaded_file is not None:
                     overlay
                 ) = predict_mri(image, model)
 
-            predicted_class = max(
-                scores,
-                key=scores.get
-            )
-
+            predicted_class = max(scores, key=scores.get)
             confidence = scores[predicted_class] * 100
 
             st.divider()
@@ -310,8 +302,9 @@ if uploaded_file is not None:
                 )
 
             st.caption(
-                "The score is the model's output, not a guarantee "
-                "that the prediction is medically correct."
+                "This score represents the model's output, "
+                "not the probability that a medical diagnosis "
+                "is correct."
             )
 
             st.subheader("Class Scores")
@@ -329,62 +322,71 @@ if uploaded_file is not None:
                 )
 
             # ------------------------------------------
-            # GRAD-CAM RESULTS
+            # GRAD-CAM VISUALIZATIONS
             # ------------------------------------------
 
             st.divider()
             st.subheader("Grad-CAM Visualizations")
 
-            col1, col2, col3 = st.columns(3)
+            if heatmap is None:
+                st.warning(
+                    "The model produced a class prediction, "
+                    "but no meaningful positive Grad-CAM "
+                    "activation was obtained for this image. "
+                    "The explanation is unavailable."
+                )
 
-            with col1:
                 st.image(
                     original,
                     caption="Original MRI",
                     use_container_width=True
                 )
 
-            with col2:
-                st.image(
-                    colored_heatmap,
-                    caption="Grad-CAM Heatmap",
-                    use_container_width=True
+            else:
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+                    st.image(
+                        original,
+                        caption="Original MRI",
+                        use_container_width=True
+                    )
+
+                with col2:
+                    st.image(
+                        colored_heatmap,
+                        caption="Grad-CAM Heatmap",
+                        use_container_width=True
+                    )
+
+                with col3:
+                    st.image(
+                        overlay,
+                        caption="Grad-CAM Overlay",
+                        use_container_width=True
+                    )
+
+                st.caption(
+                    "Red/yellow regions indicate stronger relative "
+                    "Grad-CAM activation. They do not prove that "
+                    "a region contains a tumour or define its boundary."
                 )
 
-            with col3:
-                st.image(
-                    overlay,
-                    caption="Grad-CAM Overlay",
-                    use_container_width=True
+                # Download overlay.
+                output_buffer = io.BytesIO()
+
+                Image.fromarray(overlay).save(
+                    output_buffer,
+                    format="PNG"
                 )
 
-            st.caption(
-                "Red/yellow regions indicate stronger relative "
-                "Grad-CAM activation; blue regions indicate weaker "
-                "activation. These colours do not identify tumour "
-                "boundaries or prove that a region contains a tumour."
-            )
-
-            # ------------------------------------------
-            # DOWNLOAD OVERLAY
-            # ------------------------------------------
-
-            st.subheader("Download Result")
-
-            output_buffer = io.BytesIO()
-
-            Image.fromarray(overlay).save(
-                output_buffer,
-                format="PNG"
-            )
-
-            st.download_button(
-                label="Download Grad-CAM Overlay",
-                data=output_buffer.getvalue(),
-                file_name="gradcam_overlay.png",
-                mime="image/png"
-            )
+                st.download_button(
+                    "Download Grad-CAM Overlay",
+                    data=output_buffer.getvalue(),
+                    file_name="gradcam_overlay.png",
+                    mime="image/png"
+                )
 
     except Exception as error:
-        st.error("An error occurred while processing the image.")
+        st.error("An error occurred while processing the MRI.")
         st.exception(error)
