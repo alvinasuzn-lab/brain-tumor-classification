@@ -1,6 +1,6 @@
 
+import os
 from pathlib import Path
-import io
 
 import cv2
 import gdown
@@ -8,323 +8,278 @@ import numpy as np
 import streamlit as st
 import tensorflow as tf
 from PIL import Image
-from tensorflow.keras.applications.resnet50 import preprocess_input
 
 
-# =====================================================
-# PAGE CONFIGURATION
-# =====================================================
+# -------------------- PAGE SETTINGS --------------------
+
 st.set_page_config(
-    page_title="Brain MRI Classifier",
+    page_title="Brain Tumor MRI Classifier",
     page_icon="🧠",
     layout="wide",
 )
 
-CLASS_NAMES = ["glioma", "meningioma", "notumor", "pituitary"]
+st.title("🧠 Brain Tumor MRI Classification")
+st.write(
+    "Upload a brain MRI image to predict its class "
+    "and view a Grad-CAM visualization."
+)
 
-MODEL_ID = "1sO3yNwEIu9oCfP3W_wlC6r07fhv0hEYI"
+# -------------------- MODEL SETTINGS --------------------
+
 MODEL_NAME = "best_brain_tumor_finetuned.keras"
+MODEL_ID = "1sO3yNwEIu9oCfP3W_wlC6r07fhv0hEYI"
 
 MODEL_DIR = Path.home() / ".brain_tumor_model"
 MODEL_PATH = MODEL_DIR / MODEL_NAME
 
-st.title("🧠 Brain MRI Classification")
-st.caption("Fine-tuned ResNet50 | Four-class classification")
+CLASS_NAMES = [
+    "glioma",
+    "meningioma",
+    "notumor",
+    "pituitary",
+]
 
-st.write(
-    "Upload a brain MRI image to obtain a model prediction. "
-    "Grad-CAM is optional and provides an approximate explanation."
-)
+IMG_SIZE = (224, 224)
 
 
-# =====================================================
-# DOWNLOAD AND LOAD MODEL
-# =====================================================
-@st.cache_resource(show_spinner="Preparing the trained model...")
+# -------------------- LOAD MODEL --------------------
+
+@st.cache_resource
 def load_model():
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Reuse an existing model if it loads successfully.
-    if MODEL_PATH.is_file() and MODEL_PATH.stat().st_size > 1_000_000:
-        try:
-            with MODEL_PATH.open("rb") as file:
-                header = file.read(200)
+    if not MODEL_PATH.exists() or MODEL_PATH.stat().st_size < 1_000_000:
+        url = f"https://drive.google.com/uc?id={MODEL_ID}"
 
-            if not header.startswith(
-                b"version https://git-lfs.github.com/spec/v1"
-            ):
-                return tf.keras.models.load_model(
-                    str(MODEL_PATH), compile=False
-                )
-        except Exception:
-            pass
-
-        MODEL_PATH.unlink(missing_ok=True)
-
-    # Download the model from Google Drive.
-    url = f"https://drive.google.com/uc?id={MODEL_ID}"
-
-    try:
         result = gdown.download(
             url=url,
             output=str(MODEL_PATH),
             quiet=False,
             resume=False,
         )
-    except Exception as error:
-        MODEL_PATH.unlink(missing_ok=True)
-        raise RuntimeError(
-            f"Google Drive download failed: {error}"
-        ) from error
 
-    if not result or not MODEL_PATH.is_file():
-        MODEL_PATH.unlink(missing_ok=True)
-        raise RuntimeError(
-            "Google Drive did not provide the model file. "
-            "Check the sharing permissions and download availability."
-        )
+        if not result or not MODEL_PATH.exists():
+            raise RuntimeError(
+                "Model download failed. Check that the Google Drive "
+                "file is shared as Anyone with the link — Viewer."
+            )
 
-    # Check for a likely incomplete download or an error page.
     if MODEL_PATH.stat().st_size < 1_000_000:
-        MODEL_PATH.unlink(missing_ok=True)
         raise RuntimeError(
-            "The downloaded file is too small to be the model. "
-            "Google Drive may have returned an access or quota error."
+            "The downloaded model file is too small. "
+            "Google Drive may have returned an error page instead."
         )
 
-    with MODEL_PATH.open("rb") as file:
-        header = file.read(200)
+    with open(MODEL_PATH, "rb") as f:
+        header = f.read(100)
 
-    if header.startswith(b"version https://git-lfs.github.com/spec/v1"):
-        MODEL_PATH.unlink(missing_ok=True)
+    if b"Git LFS pointer" in header:
         raise RuntimeError(
-            "The downloaded file is a Git LFS pointer, not the actual model."
+            "A Git LFS pointer was downloaded instead of the model."
         )
 
-    try:
-        return tf.keras.models.load_model(
-            str(MODEL_PATH), compile=False
-        )
-    except Exception as error:
-        MODEL_PATH.unlink(missing_ok=True)
-        raise RuntimeError(
-            "The downloaded file could not be loaded as a Keras model."
-        ) from error
-
-
-try:
-    model = load_model()
-except Exception as error:
-    st.error("Unable to prepare the trained model.")
-    st.code(str(error))
-    st.info(
-        "Check that Google Drive General access is set to "
-        "'Anyone with the link — Viewer'. If access is correct, "
-        "Google Drive may be blocking automated downloads or "
-        "enforcing a download limit."
+    return tf.keras.models.load_model(
+        str(MODEL_PATH),
+        compile=False,
     )
-    st.stop()
 
 
-# =====================================================
-# PREPROCESS IMAGE
-# =====================================================
-def prepare_image(image):
-    image = image.convert("RGB").resize((224, 224))
-    array = np.asarray(image, dtype=np.float32)
-    return np.expand_dims(array, axis=0)
+# -------------------- IMAGE PREPROCESSING --------------------
+
+def preprocess_image(image):
+    image = image.convert("RGB")
+    resized = image.resize(IMG_SIZE)
+
+    array = np.asarray(resized, dtype=np.float32)
+    batch = np.expand_dims(array, axis=0)
+
+    return batch
 
 
-# =====================================================
-# PREDICTION
-# =====================================================
-def predict_image(batch):
-    predictions = model.predict(batch, verbose=0)[0]
+# -------------------- GRAD-CAM --------------------
 
-    if len(predictions) != len(CLASS_NAMES):
-        raise ValueError(
-            f"Expected 4 class scores, received {len(predictions)}."
-        )
-
-    index = int(np.argmax(predictions))
-    return CLASS_NAMES[index], predictions, index
-
-
-# =====================================================
-# GRAD-CAM
-# =====================================================
-def generate_gradcam(batch, class_index):
+def generate_gradcam(model, image_batch, class_index):
     try:
-        backbone = model.get_layer("resnet50")
-        layer_names = {layer.name for layer in backbone.layers}
+        # The ResNet50 output is the final convolutional feature map
+        # before global average pooling and the classification layers.
+        resnet_layer = model.get_layer("resnet50")
 
-        if "conv5_block3_out" in layer_names:
-            target_name = "conv5_block3_out"
-        elif "conv4_block6_out" in layer_names:
-            target_name = "conv4_block6_out"
-        else:
-            return None, None
-
-        feature_model = tf.keras.Model(
-            inputs=backbone.input,
+        grad_model = tf.keras.Model(
+            inputs=model.inputs,
             outputs=[
-                backbone.get_layer(target_name).output,
-                backbone.output,
+                resnet_layer.output,
+                model.output,
             ],
         )
 
-        gap = model.get_layer("gap")
-        dropout = model.get_layer("dropout")
-        dense = model.get_layer("dense_features")
-        output_layer = model.get_layer("class_predictions")
-
-        processed = preprocess_input(
-            tf.convert_to_tensor(batch, dtype=tf.float32)
+        image_tensor = tf.convert_to_tensor(
+            image_batch,
+            dtype=tf.float32,
         )
 
         with tf.GradientTape() as tape:
-            conv_features, backbone_output = feature_model(
-                processed, training=False
+            conv_outputs, predictions = grad_model(
+                image_tensor,
+                training=False,
             )
 
-            pooled = gap(backbone_output)
-            dropped = dropout(pooled, training=False)
-            features = dense(dropped)
+            class_score = predictions[:, class_index]
 
-            logits = tf.linalg.matmul(features, output_layer.kernel)
-
-            if output_layer.use_bias:
-                logits = logits + output_layer.bias
-
-            score = logits[:, class_index]
-
-        gradients = tape.gradient(score, conv_features)
+        gradients = tape.gradient(class_score, conv_outputs)
 
         if gradients is None:
-            return None, None
+            raise RuntimeError(
+                "Gradients could not be calculated for this model."
+            )
 
+        # Average gradients across the spatial dimensions.
         weights = tf.reduce_mean(
-            gradients, axis=(1, 2), keepdims=True
+            gradients,
+            axis=(1, 2),
         )
 
-        cam = tf.reduce_sum(
-            weights * conv_features, axis=-1
-        )[0]
+        conv_outputs = conv_outputs[0]
+        weights = weights[0]
 
-        cam = tf.nn.relu(cam).numpy()
+        # Weighted combination of feature maps.
+        heatmap = tf.reduce_sum(
+            conv_outputs * weights,
+            axis=-1,
+        )
 
-        if not np.isfinite(cam).all() or cam.max() <= 1e-8:
-            return None, None
+        # Keep positive activations and normalize.
+        heatmap = tf.maximum(heatmap, 0)
+        maximum = tf.reduce_max(heatmap)
 
-        cam = cam / (cam.max() + 1e-8)
-        cam = cv2.resize(cam, (224, 224))
+        heatmap = heatmap / (maximum + tf.keras.backend.epsilon())
+        heatmap = heatmap.numpy()
 
-        activation = np.uint8(np.clip(cam, 0, 1) * 255)
+        # Resize heatmap to match the original MRI dimensions.
+        heatmap = cv2.resize(
+            heatmap,
+            (IMG_SIZE[1], IMG_SIZE[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
 
-        original = batch[0].astype(np.uint8)
-        gray = cv2.cvtColor(original, cv2.COLOR_RGB2GRAY)
+        # IMPORTANT: Convert grayscale heatmap into a colour heatmap.
+        heatmap_uint8 = np.uint8(
+            np.clip(heatmap, 0, 1) * 255
+        )
+
+        heatmap_color = cv2.applyColorMap(
+            heatmap_uint8,
+            cv2.COLORMAP_JET,
+        )
+
+        # OpenCV uses BGR; Streamlit expects RGB.
+        heatmap_color = cv2.cvtColor(
+            heatmap_color,
+            cv2.COLOR_BGR2RGB,
+        )
+
+        # Blend colour heatmap with the original MRI.
+        original = np.uint8(
+            np.clip(image_batch[0], 0, 255)
+        )
 
         overlay = cv2.addWeighted(
-            gray, 0.65, activation, 0.35, 0
+            original,
+            0.55,
+            heatmap_color,
+            0.45,
+            0,
         )
 
-        return activation, overlay
+        return heatmap_color, overlay
 
     except Exception as error:
-        st.warning(f"Grad-CAM could not be generated: {error}")
-        return None, None
+        raise RuntimeError(
+            f"Grad-CAM generation failed: {error}"
+        ) from error
 
 
-# =====================================================
-# USER INTERFACE
-# =====================================================
+# -------------------- MAIN APP --------------------
+
 uploaded_file = st.file_uploader(
-    "Upload brain MRI",
-    type=["png", "jpg", "jpeg"],
+    "Upload an MRI image",
+    type=["jpg", "jpeg", "png"],
 )
 
 if uploaded_file is not None:
-    try:
-        image = Image.open(uploaded_file).convert("RGB")
-        st.image(image, caption="Uploaded MRI", width=400)
+    image = Image.open(uploaded_file).convert("RGB")
 
-        show_gradcam = st.checkbox(
-            "Generate grayscale Grad-CAM",
-            value=False,
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("Original MRI")
+        st.image(image, use_container_width=True)
+
+    with st.spinner("Loading model..."):
+        try:
+            model = load_model()
+        except Exception as error:
+            st.error(f"Could not load the model: {error}")
+            st.stop()
+
+    image_batch = preprocess_image(image)
+
+    with st.spinner("Classifying MRI..."):
+        predictions = model.predict(image_batch, verbose=0)[0]
+
+    predicted_index = int(np.argmax(predictions))
+    predicted_class = CLASS_NAMES[predicted_index]
+    confidence = float(predictions[predicted_index]) * 100
+
+    st.subheader("Prediction")
+    st.success(f"Predicted class: **{predicted_class.upper()}**")
+    st.metric("Model confidence", f"{confidence:.2f}%")
+
+    st.subheader("Class probabilities")
+
+    for index, class_name in enumerate(CLASS_NAMES):
+        st.write(f"**{class_name.title()}** — {predictions[index] * 100:.2f}%")
+        st.progress(
+            float(np.clip(predictions[index], 0, 1))
         )
 
-        if st.button("Analyze MRI", type="primary"):
-            with st.spinner("Analyzing MRI..."):
-                batch = prepare_image(image)
-                predicted_class, scores, index = predict_image(batch)
+    st.divider()
+    st.subheader("Grad-CAM Explainability")
+    st.write(
+        "The coloured regions highlight image features that influence "
+        "the model's prediction. Red/yellow indicates stronger "
+        "relative activation; blue indicates weaker activation."
+    )
 
-            confidence = float(scores[index])
-
-            st.divider()
-            st.subheader("Prediction")
-            st.success(f"Predicted class: {predicted_class.upper()}")
-            st.metric("Model score", f"{confidence * 100:.2f}%")
-
-            st.caption(
-                "This is a model prediction, not a medical diagnosis."
+    try:
+        with st.spinner("Generating colour Grad-CAM..."):
+            heatmap_color, overlay = generate_gradcam(
+                model,
+                image_batch,
+                predicted_index,
             )
 
-            with st.expander("View all class scores"):
-                for name, score in zip(CLASS_NAMES, scores):
-                    st.write(f"**{name.capitalize()}**")
-                    st.progress(float(np.clip(score, 0, 1)))
-                    st.caption(f"{float(score) * 100:.2f}%")
+        col3, col4 = st.columns(2)
 
-            if show_gradcam:
-                with st.spinner("Generating Grad-CAM..."):
-                    activation, overlay = generate_gradcam(batch, index)
+        with col3:
+            st.write("**Colour heatmap**")
+            st.image(
+                heatmap_color,
+                channels="RGB",
+                use_container_width=True,
+            )
 
-                if activation is not None:
-                    st.subheader("Grayscale Grad-CAM")
-                    col1, col2, col3 = st.columns(3)
-
-                    with col1:
-                        st.image(image, caption="Original MRI")
-
-                    with col2:
-                        st.image(
-                            activation,
-                            caption="Activation map",
-                            clamp=True,
-                        )
-
-                    with col3:
-                        st.image(
-                            overlay,
-                            caption="Grayscale overlay",
-                            clamp=True,
-                        )
-
-                    buffer = io.BytesIO()
-                    Image.fromarray(overlay).save(buffer, format="PNG")
-
-                    st.download_button(
-                        "Download Grad-CAM",
-                        data=buffer.getvalue(),
-                        file_name="brain_mri_gradcam.png",
-                        mime="image/png",
-                    )
-
-                    st.info(
-                        "Grad-CAM highlights approximate regions that "
-                        "influenced the prediction. It does not show "
-                        "confirmed tumour boundaries."
-                    )
-                else:
-                    st.warning(
-                        "Prediction succeeded, but Grad-CAM "
-                        "could not be generated."
-                    )
+        with col4:
+            st.write("**Heatmap overlaid on MRI**")
+            st.image(
+                overlay,
+                channels="RGB",
+                use_container_width=True,
+            )
 
     except Exception as error:
-        st.error("Unable to process the MRI image.")
-        st.exception(error)
+        st.warning(str(error))
 
-
-st.divider()
-st.caption("Academic project | Not intended for clinical diagnosis")
+    st.caption(
+        "Educational/research demonstration only. "
+        "This model is not a substitute for professional medical diagnosis."
+    )
