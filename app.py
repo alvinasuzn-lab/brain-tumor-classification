@@ -29,9 +29,7 @@ CLASS_NAMES = ["Glioma", "Meningioma", "No Tumor", "Pituitary Tumor"]
 # The saved model expects RAW 0-255 RGB pixels.
 
 # Grad-CAM layer: final ResNet50 feature map (feeds GAP)
-CAM_LAYERS = {
-    "conv5_block3_out (7x7)": "conv5_block3_out",
-}
+GRADCAM_LAYER = "conv5_block3_out"
 LOW_CONFIDENCE = 0.70      # below this, show a warning
 USE_LOGIT_TARGET = True  # explain the pre-softmax class score
 
@@ -67,21 +65,13 @@ def load_model():
 
     resnet = model.get_layer("resnet50")
 
-    # One backbone-with-feature-map model per candidate layer.
-    # Each returns (feature map, backbone output).
-    grad_models = {}
-    for label, layer_name in CAM_LAYERS.items():
-        try:
-            conv_layer = resnet.get_layer(layer_name)
-        except ValueError:
-            continue
-        grad_models[label] = tf.keras.Model(
-            inputs=resnet.inputs,
-            outputs=[conv_layer.output, resnet.output],
-        )
+    conv_layer = resnet.get_layer(GRADCAM_LAYER)
 
-    if not grad_models:
-        raise RuntimeError("None of the Grad-CAM layers were found in resnet50.")
+    # Backbone that returns (final conv feature map, backbone output)
+    grad_model = tf.keras.Model(
+        inputs=resnet.inputs,
+        outputs=[conv_layer.output, resnet.output],
+    )
 
     head = {
         "gap": model.get_layer("gap"),
@@ -89,7 +79,7 @@ def load_model():
         "dense": model.get_layer("dense_features"),
         "classifier": model.get_layer("class_predictions"),
     }
-    return model, grad_models, head
+    return model, grad_model, head
 
 
 # --------------------------------------------------
@@ -129,7 +119,7 @@ def compute_cam(conv_output, gradients, method):
     return tf.nn.relu(cam)[0].numpy()
 
 
-def predict_and_gradcam(raw_batch, model, grad_models, head, layer_label, method):
+def predict_and_gradcam(raw_batch, model, grad_model, head, method):
     x_raw = tf.convert_to_tensor(raw_batch, dtype=tf.float32)
 
     # 1) The real prediction comes from the full saved model.
@@ -137,7 +127,6 @@ def predict_and_gradcam(raw_batch, model, grad_models, head, layer_label, method
     predicted_index = int(np.argmax(probabilities))
 
     # 2) CAM path: preprocess_input -> backbone -> same head layers.
-    grad_model = grad_models[layer_label]
     backbone_input = backbone_preprocess(x_raw)
 
     with tf.GradientTape() as tape:
@@ -318,22 +307,17 @@ st.warning(
     "medical diagnostic tool."
 )
 
-with st.sidebar:
-    st.header("Grad-CAM settings")
-    method = st.selectbox("Method", ["Grad-CAM", "Grad-CAM++"], index=0)
-    layer_label = next(iter(CAM_LAYERS))
-    use_mask = st.checkbox("Restrict heat to the head region", value=True)
-    focus = st.slider("Focus (hide weak activation)", 0.0, 0.8, 0.45, 0.05,
-                      help="Higher = only the strongest evidence is shown.")
-    single_region = st.checkbox("Show only the strongest region", value=True,
-                                help="Untick to also see secondary regions.")
-    min_level = st.slider("Overlay threshold", 0.0, 0.9, 0.15, 0.05,
-                          help="Activations below this level are not coloured in the overlay.")
+# Fixed Grad-CAM settings (no sidebar)
+method = "Grad-CAM"
+use_mask = True        # hide heat outside the head
+focus = 0.45           # hide weak activation
+single_region = True   # show only the strongest region
+min_level = 0.15       # overlay colour threshold
 
-    st.header("Image cleaning")
-    clean_image = st.checkbox(
-        "Clean image (crop + contrast)", value=False,
-        help="Tick this for Google/web images. Leave it off for images from your test folder.")
+clean_image = st.checkbox(
+    "Clean image (tick this for Google/web images, leave off for test-folder images)",
+    value=False,
+)
 
 uploaded_file = st.file_uploader("Upload MRI image", type=["jpg", "jpeg", "png"])
 
@@ -346,11 +330,9 @@ if uploaded_file is not None:
         original_image, raw_batch = prepare_image(image)
 
         with st.spinner("Analyzing MRI image..."):
-            model, grad_models, head = load_model()
-            if layer_label not in grad_models:
-                layer_label = next(iter(grad_models))
+            model, grad_model, head = load_model()
             probabilities, predicted_index, cam, paths_match, max_diff = (
-                predict_and_gradcam(raw_batch, model, grad_models, head, layer_label, method)
+                predict_and_gradcam(raw_batch, model, grad_model, head, method)
             )
             heatmap_rgb, overlay = create_visualizations(
                 original_image, cam, use_mask, focus, single_region, min_level
@@ -405,7 +387,7 @@ if uploaded_file is not None:
             st.write("Input: raw 0-255 RGB, resized to 224 x 224")
             st.write("Model pipeline: augmentation (off at inference) -> preprocess_input -> ResNet50")
             st.write("CAM method:", method)
-            st.write("CAM layer:", CAM_LAYERS[layer_label], f"({cam.shape[0]}x{cam.shape[1]})")
+            st.write("CAM layer:", GRADCAM_LAYER, f"({cam.shape[0]}x{cam.shape[1]})")
             st.write("Head-region mask applied:", use_mask)
             st.write("Image cleaning applied:", clean_image)
             st.write("Focus:", focus, "| strongest region only:", single_region)
